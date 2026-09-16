@@ -15,9 +15,10 @@ import (
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
-	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
+	APIKey               string        // 面板/网关共同鉴权密钥；空 = 不鉴权
+	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时回落服务启动值或默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	RealmFallback        bool          // 跨域回落（cn/global 账号互备；config global.realm_fallback）
 }
 
 // Holder 原子持有当前快照。

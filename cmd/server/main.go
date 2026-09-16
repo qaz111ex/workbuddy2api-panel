@@ -30,7 +30,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.10.0-panel"
+const appVersion = "1.11.2-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -113,8 +113,8 @@ func main() {
 			Store:      store,
 			Available:  p.AvailableUIDs,
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
-			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
-			AvailableForModel: realmAwareAvailableForModel(p),
+			// 裸名在跨域回落开启时不限域（粘性可绑定任一域的同模型账号）。
+			AvailableForModel: realmAwareAvailableForModel(p, cfg.Global.RealmFallback),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -218,6 +218,7 @@ func main() {
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		RealmFallback:        cfg.Global.RealmFallback,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -272,6 +273,8 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 跨域回落：首选域账号耗尽时自动改用另一域的同名模型账号（缺省 true）。
+		RealmFallback: cfg.Global.RealmFallback,
 		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
 	chatHandler = h
@@ -372,6 +375,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		RealmFallback:        newCfg.Global.RealmFallback,
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

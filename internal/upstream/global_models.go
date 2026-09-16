@@ -23,9 +23,10 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// GlobalModelNames 国际版（global realm）历史静态名单（PLAN §7.2 附录 21 名）。
-// 纯动态化后**不再作为模型目录的基底/兜底**：/v1/models 只透出上游实际下发的模型。
-// 保留仅作历史对照（global e2e 观测日志差集参照）。
+// GlobalModelNames 国际版（global realm）已知可用模型名单（PLAN §7.2 附录 21 名）。
+// 不作基底/失败兜底（拉不出目录仍视为域不可用）；只在探测成功时**补缺**：上游目录
+// 不下发但产品实际可用（含限免）的模型（如 deepseek-v4.1-flash）经此进并集，
+// 否则客户端在 /v1/models 里看不到、只能盲猜模型名。
 var GlobalModelNames = []string{
 	"default-model",
 	"fast-model",
@@ -78,8 +79,8 @@ var globalModelsProbePaths = []string{
 
 // FetchGlobalModels 探测 global 账号的模型名目录并返回**模型名列表**（无元数据）。
 //
-// 纯动态：成功返回并集结果（去重），缓存 1h；失败（两路全非 2xx / 解析失败 /
-// 空列表）记 5min 负缓存，返回 nil（无静态回落）。缓存/负缓存命中：直接返回，零上游调用。
+// 成功返回并集结果（去重 = 探测结果 ∪ 已知可用名单补缺），缓存 1h；失败（两路全非 2xx /
+// 解析失败 / 空列表）记 5min 负缓存，返回 nil（无静态回落）。缓存/负缓存命中：直接返回，零上游调用。
 //
 // 调用方负责：仅在有 global 账号时调用（无则不探测）；GlobalEnabled 关闭时（逃生门）
 // 不得调用——本方法由 globalOn(a) 内部兜底，若账号因开关回落 cn 则返回 nil。
@@ -148,6 +149,21 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		seen[id] = true
 		merged = append(merged, id)
 	}
+	// 已知可用名单补缺：上游目录不下发、但产品侧可正常调用（且多为限免）的
+	// 国际版模型（deepseek-v4.1-flash 等）——探测结果为准，静态只补缺失项。
+	// 补进来的条目只带 ID：窗口走 ContextWindowListingV4 四级查找链兜底，
+	// 档位走 globalEffortFallback（deepseek-v4.1-flash 国际版仅 high）。
+	// infos 为 nil（窄表形态）时保持 nil——调用方按 ID 名单输出裸条目。
+	for _, id := range GlobalModelNames {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		merged = append(merged, id)
+		if infos != nil {
+			infos = append(infos, ModelInfo{ID: id})
+		}
+	}
 
 	c.globalModels.Lock()
 	c.globalModels.names = merged
@@ -156,6 +172,21 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	c.globalModels.lastFail = time.Time{}
 	c.globalModels.Unlock()
 	return merged, infos
+}
+
+// GlobalModelsSnapshot 只读返回 global 模型目录缓存（**不探测、不发起任何上游调用**）。
+// ok=false 表示缓存未填充（无 global 账号 / 从未探测 / 负缓存期内）→ 调用方不设限。
+// 供 chat 路由做「该域是否提供此模型」的判定（跨域回落的准入检查）。
+func (c *Client) GlobalModelsSnapshot() ([]string, bool) {
+	if c == nil {
+		return nil, false
+	}
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	if len(c.globalModels.names) == 0 {
+		return nil, false
+	}
+	return append([]string(nil), c.globalModels.names...), true
 }
 
 // probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge）：
@@ -366,18 +397,54 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelI
 	return names, infos, err
 }
 
-// parseGlobalModelNames 容忍两种形态解析模型目录：
-//   - 对象数组（主形态，与 CN /console/enterprises/personal/models 同构）：data.models[]，
-//     dynModelEntry 全字段（maxInputTokens/maxOutputTokens/maxAllowedSize/
-//     supportsReasoning/supportsImages/reasoning.*）；id 缺省时回退 name；disabled 剔除；
-//   - 窄表：data 为字符串数组 → 仅 ID，元数据留空（窗口由调用方四级查找链兜底）。
+// globalModelAltEntry 国际站目录的宽松条目：兼容键名漂移（PR #21 实测形态）。
+// 标准键（id/maxInputTokens/maxOutputTokens/reasoning.* 等）由内嵌 dynModelEntry
+// 解析；别名键在此兜底：id → modelId → model → name；窗口 → contextWindow / maxTokens。
+type globalModelAltEntry struct {
+	dynModelEntry
+	ModelID       string `json:"modelId"`
+	Model         string `json:"model"`
+	ContextWindow int64  `json:"contextWindow"`
+	MaxTokensAlt  int64  `json:"maxTokens"`
+}
+
+// modelInfo 按条目构造 ModelInfo（id 与窗口的别名键兜底，其余字段口径与 CN 一致）。
+func (m globalModelAltEntry) modelInfo() ModelInfo {
+	mi := m.dynModelEntry.modelInfo()
+	if mi.ID == "" {
+		mi.ID = strings.TrimSpace(m.ModelID)
+	}
+	if mi.ID == "" {
+		mi.ID = strings.TrimSpace(m.Model)
+	}
+	if mi.ID == "" {
+		mi.ID = strings.TrimSpace(m.Name)
+	}
+	if mi.ContextWindow == 0 {
+		mi.ContextWindow = m.ContextWindow
+	}
+	if mi.MaxTokens == 0 {
+		mi.MaxTokens = m.MaxTokensAlt
+	}
+	return mi
+}
+
+// parseGlobalModelNames 解析国际站模型目录，产出模型名、全字段条目与 effort 能力桶
+// （supportedEfforts/defaultEffort）。解析成功但名单为空 → 返回错误（等价"该端点没给全"）。
 //
-// 同时产出 effort 能力桶（supportedEfforts/defaultEffort）。
-// 解析成功但名单为空 → 返回错误（等价"该端点没给全"）。
+// envelope 容忍（PR #21 实测国际站曾切换下发位置）：payload 依次尝试
+// data（直接数组 / data.models / data.items / data.list）→ 顶层 models / items / list /
+// result；条目可以是字符串（裸 ID）或对象（id 依次回退 id → modelId → model → name，
+// 窗口键兼容 contextWindow / maxTokens）；disabled 条目剔除。
+// 首个解析出非空名单的候选即选中——只认单一形态会把登录成功的账号误判成"无模型"。
 func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	var env struct {
-		Code int             `json:"code"`
-		Data json.RawMessage `json:"data"`
+		Code   int             `json:"code"`
+		Data   json.RawMessage `json:"data"`
+		Models json.RawMessage `json:"models"`
+		Items  json.RawMessage `json:"items"`
+		List   json.RawMessage `json:"list"`
+		Result json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("global models parse: %w", err)
@@ -385,62 +452,92 @@ func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, effor
 	if env.Code != 0 {
 		return nil, nil, nil, nil, fmt.Errorf("global models code=%d", env.Code)
 	}
-	trimmed := strings.TrimSpace(string(env.Data))
-	if strings.HasPrefix(trimmed, "[") {
-		// 窄表形态：data 为字符串数组（无 effort 元数据、无对象字段 → infos nil）。
-		var arr []string
-		if err := json.Unmarshal(env.Data, &arr); err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("global models parse (narrow): %w", err)
-		}
-		out := make([]string, 0, len(arr))
-		for _, id := range arr {
-			if id = strings.TrimSpace(id); id != "" {
-				out = append(out, id)
-			}
-		}
-		if len(out) == 0 {
-			return nil, nil, nil, nil, fmt.Errorf("global models empty list")
-		}
-		return out, nil, nil, nil, nil
-	}
-	// 对象形态：data.models[]，字段名与 CN 目录一致。dynModelEntry 与 CN FetchModels
-	// 共用（两域模型对象同构），零解析口径漂移。
-	var obj struct {
-		Models []dynModelEntry `json:"models"`
-	}
-	if err := json.Unmarshal(env.Data, &obj); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("global models parse: %w", err)
-	}
-	out := make([]string, 0, len(obj.Models))
-	infos = make([]ModelInfo, 0, len(obj.Models))
-	for _, m := range obj.Models {
-		id := m.ID
-		if id == "" {
-			id = m.Name
-		}
-		if id == "" || m.Disabled {
+	for _, payload := range []json.RawMessage{env.Data, env.Models, env.Items, env.List, env.Result} {
+		entries, ok := parseGlobalModelPayload(payload)
+		if !ok || len(entries) == 0 {
 			continue
 		}
-		out = append(out, id)
-		mi := m.modelInfo()
-		mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
-		infos = append(infos, mi)
-		// effort 桶：supportedEfforts 数组优先；缺数组但 reasoning.effort 单档非空 → 视作单档表。
-		if len(m.Reasoning.SupportedEfforts) > 0 {
-			if efforts == nil {
-				efforts = make(map[string][]string)
+		names = make([]string, 0, len(entries))
+		infos = make([]ModelInfo, 0, len(entries))
+		for _, mi := range entries {
+			names = append(names, mi.ID)
+			infos = append(infos, mi)
+			if len(mi.Efforts) > 0 {
+				if efforts == nil {
+					efforts = make(map[string][]string)
+				}
+				efforts[mi.ID] = mi.Efforts
 			}
-			efforts[id] = m.Reasoning.SupportedEfforts
+			if mi.DefaultEffort != "" {
+				if defaults == nil {
+					defaults = make(map[string]string)
+				}
+				defaults[mi.ID] = mi.DefaultEffort
+			}
 		}
-		if d := m.Reasoning.DefaultEffort; d != "" {
-			if defaults == nil {
-				defaults = make(map[string]string)
+		return names, infos, efforts, defaults, nil
+	}
+	return nil, nil, nil, nil, fmt.Errorf("global models empty list")
+}
+
+// parseGlobalModelPayload 解析一个候选 payload：字符串数组（窄表）、对象数组
+// （元素为字符串或对象）、或容器对象（models / items / list / result，递归解析）。
+// 解析出非空条目 → ok=true。
+func parseGlobalModelPayload(raw json.RawMessage) (out []ModelInfo, ok bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, false
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		for _, id := range arr {
+			if id = strings.TrimSpace(id); id != "" {
+				out = append(out, ModelInfo{ID: id})
 			}
-			defaults[id] = d
+		}
+		return out, len(out) > 0
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err == nil {
+		for _, it := range items {
+			if mi, okItem := parseGlobalModelItem(it); okItem {
+				out = append(out, mi)
+			}
+		}
+		return out, len(out) > 0
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, false
+	}
+	for _, key := range []string{"models", "items", "list", "result"} {
+		if v, okKey := obj[key]; okKey {
+			if sub, okSub := parseGlobalModelPayload(v); okSub {
+				return sub, true
+			}
 		}
 	}
-	if len(out) == 0 {
-		return nil, nil, nil, nil, fmt.Errorf("global models empty list")
+	return nil, false
+}
+
+// parseGlobalModelItem 单个条目：字符串 → 裸 ID；对象 → globalModelAltEntry
+// （disabled / 空 id 剔除）。
+func parseGlobalModelItem(raw json.RawMessage) (ModelInfo, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		s = strings.TrimSpace(s)
+		return ModelInfo{ID: s}, s != ""
 	}
-	return out, infos, efforts, defaults, nil
+	var m globalModelAltEntry
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ModelInfo{}, false
+	}
+	if m.Disabled {
+		return ModelInfo{}, false
+	}
+	mi := m.modelInfo()
+	if mi.ID == "" {
+		return ModelInfo{}, false
+	}
+	return mi, true
 }

@@ -698,9 +698,9 @@ func (c *Client) chatBase(a *auth.Auth) string {
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
-		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
-		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
-		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
+		// global 域降级源 = 远端探测桶（权威）∪ 静态兜底表（CN 继承 + 国际版专有覆盖）。
+		// 当前探测桶为空时也按静态表归一化：共享模型与 CN 同档位（issue #84 实测
+		// dsv4.1-flash low/high/max 生效），国际版专有模型按各自档位表（gpt-5.6-* 等）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)

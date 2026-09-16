@@ -248,15 +248,38 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
-	infos, err := p.cfg.Upstream.FetchModels(acct)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
-		return
+	// 按账号 realm 分流：国际版账号必须走 global 目录探测。此前不分流时它会被送去
+	// CN 的 /console/enterprises/personal/models，而该路径在国际版 base 上返回 500
+	// HTML——这是国际版账号打开本页必报 500 的根因。
+	// id 带上网关路由前缀：前端显示的就是调用时要填的完整模型名（裸名会被当作 CN 路由）。
+	realm := acct.Realm()
+	modelPrefix := "cn:"
+	var infos []upstream.ModelInfo
+	if acct.IsGlobal() {
+		modelPrefix = "global:"
+		infos = p.cfg.Upstream.FetchGlobalModelInfos(acct)
+		if len(infos) == 0 {
+			// 窄表形态（上游只给 ID 名单）→ 按 ID 输出裸条目，窗口/档位走兜底链。
+			for _, id := range p.cfg.Upstream.FetchGlobalModels(acct) {
+				infos = append(infos, upstream.ModelInfo{ID: id})
+			}
+		}
+		if len(infos) == 0 {
+			writeErr(w, http.StatusBadGateway, "fetch global models: 上游未返回可用模型")
+			return
+		}
+	} else {
+		var err error
+		infos, err = p.cfg.Upstream.FetchModels(acct)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
+			return
+		}
 	}
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
 		entry := map[string]any{
-			"id":                   mi.ID,
+			"id":                   modelPrefix + mi.ID,
 			"name":                 mi.Name,
 			"default_effort":       mi.DefaultEffort,
 			"supported_efforts":    mi.Efforts,
@@ -284,7 +307,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
 			entry["max_output_tokens"] = mo
 		}
-		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+		if efforts, def := upstream.EffortListing(realm, mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
 			entry["supported_efforts"] = efforts
 			if def != "" {
 				entry["default_effort"] = def

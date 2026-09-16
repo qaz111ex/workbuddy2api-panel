@@ -74,6 +74,12 @@ type Config struct {
 		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
 		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
 		Enabled bool `json:"enabled"`
+		// RealmFallback 跨域回落：首选域（显式前缀，或裸名的目录首选域）没有可用
+		// 账号时，自动改用另一域的同名模型账号继续服务——客户端无需因账号池变化
+		// 修改模型名（cn: / global: 前缀仍可用，只是不再"钉死"）。缺省 true；
+		// 显式 "realm_fallback": false 关闭（严格按前缀/默认域路由，不跨域）。
+		// 仅当另一域目录确认提供该模型时才回落（目录无数据时乐观尝试）。
+		RealmFallback bool `json:"realm_fallback"`
 		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
 		// https://www.workbuddy.ai（internal/upstream.defaultGlobalBase）。
 		ChatBase    string `json:"chat_base"`
@@ -197,8 +203,10 @@ func Default() *Config {
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
+	// RealmFallback 缺省 true（国际版账号受限时自动借用国内版账号，反之亦然）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
+	c.Global.RealmFallback = true
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3

@@ -62,6 +62,11 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
+	// RealmFallback 跨域回落开关（config global.realm_fallback，缺省 true；Live 优先）。
+	// 首选域（显式前缀或裸名的目录首选域）没有可用账号时，自动改用另一域的同名
+	// 模型账号继续服务，客户端无需因账号池变化修改模型名。
+	RealmFallback bool
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -431,7 +436,7 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
 	if acct == nil {
 		return nil
 	}
@@ -465,6 +470,111 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	return dynamicModelsCache.ids
 }
 
+// ---------------------------------------------------------------------------
+// 跨域回落（realm fallback）：cn/global 双域账号互备，客户端无需改模型名
+// ---------------------------------------------------------------------------
+
+// realmFallbackOn 跨域回落开关（面板热改优先，静态字段兜底）。
+func (h *Handler) realmFallbackOn() bool {
+	if h.cfg.Live != nil {
+		return h.cfg.Live.Load().RealmFallback
+	}
+	return h.cfg.RealmFallback
+}
+
+// realmOrderFor 计算本请求的跨域候选顺序（去重、保序）：
+//
+//   - 显式前缀（cn:/global:）→ 前缀域为首选；realm_fallback 开启且另一域目录
+//     "可能"提供该模型（有/未知）时，另一域列为次选（首选域账号耗尽时自动切换）。
+//   - 裸名 → 保持 cn 优先（现状零回归）；cn 目录明确没有该模型时让 global 先行
+//     （避免先白撞一次 11102）。次选域同样按目录可能提供性追加。
+//   - global.enabled=false（逃生门）恒 [cn]。
+//
+// model 为客户端原始请求名，bare 为剥前缀后的裸模型名。
+func (h *Handler) realmOrderFor(model, bare string) []string {
+	if !h.cfg.GlobalEnabled {
+		return []string{"cn"}
+	}
+	primary := ""
+	if HasRealmPrefix(model) {
+		primary, _ = resolveModel(model)
+	} else {
+		primary = "cn"
+		if h.realmModelState("cn", bare) == 0 {
+			primary = "global" // cn 目录明确没有：别先白撞
+		}
+	}
+	order := []string{primary}
+	if h.realmFallbackOn() && h.realmModelState(otherRealm(primary), bare) != 0 {
+		order = append(order, otherRealm(primary))
+	}
+	return order
+}
+
+// otherRealm 返回另一域（cn ↔ global）。
+func otherRealm(realm string) string {
+	if realm == "global" {
+		return "cn"
+	}
+	return "global"
+}
+
+// realmModelState realm 目录对该模型的三态：-1 未知（目录未拉取）/ 0 明确无 / 1 有。
+// 数据来自两端只读快照（CN：/v1/models 动态缓存；global：探测缓存），零上游调用。
+func (h *Handler) realmModelState(realm, model string) int {
+	if model == "" {
+		return -1
+	}
+	if realm == "global" {
+		names, ok := h.cfg.Upstream.GlobalModelsSnapshot()
+		if !ok {
+			return -1
+		}
+		for _, id := range names {
+			if id == model {
+				return 1
+			}
+		}
+		return 0
+	}
+	infos := cachedModelsSnapshot()
+	if len(infos) == 0 {
+		return -1
+	}
+	for _, mi := range infos {
+		if mi.ID == model {
+			return 1
+		}
+	}
+	return 0
+}
+
+// chooseRealm 按候选顺序返回第一个「有未试健康账号」的域（skip 中的域跳过）；全部
+// 不可用 → ""（调用方维持当前域，让选号走全冷却兜底）。
+func (h *Handler) chooseRealm(order []string, blocked, skip map[string]bool, model string, tried map[string]bool) string {
+	for _, r := range order {
+		if blocked[r] || skip[r] {
+			continue
+		}
+		for _, uid := range h.cfg.Pool.AvailableUIDsForModelRealm(model, r) {
+			if !tried[uid] {
+				return r
+			}
+		}
+	}
+	return ""
+}
+
+// realmAllowed 报告 realm 是否在本请求的候选顺序内（粘性号域校验用）。
+func realmAllowed(order []string, realm string) bool {
+	for _, r := range order {
+		if r == realm {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
@@ -492,8 +602,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
-	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	// realm 只作**首选域**：跨域回落开启时，首选域账号耗尽会自动切到另一域
+	// （见 realmOrderFor / chooseRealm），客户端无需因账号更换修改模型名。
+	_, bareModel := resolveModel(peek.Model)
+	realmOrder := h.realmOrderFor(peek.Model, bareModel)
+	realm := realmOrder[0]
+	// realmBlocked 本请求内被判定「该域没有此模型」的域（11102 + 目录确认）：
+	// 后续选号直接跳过，避免在同一域逐号撞 11102 浪费轮转。
+	realmBlocked := map[string]bool{}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -635,19 +751,49 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// 轮转预算：有跨域候选且回落户确实有账号时额外给 1 次尝试，保证首选域账号
+	// 全部试完（MaxRotate 次）后另一域仍有一次机会——否则多账号域会把预算耗尽，
+	// 跨域回落永远轮不到（回落形同虚设）。纯单域部署（回落户无账号）不加预算，
+	// 行为与历史完全一致。
+	attempts := h.cfg.MaxRotate
+	if len(realmOrder) > 1 {
+		if total, _, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(realmOrder[1]); total > 0 {
+			attempts++
+		}
+	}
+	// realmTries 各域本请求已发起的尝试数：首选域用满配额（MaxRotate-1，至少 1）后
+	// 把机会优先让给备选域——无论首选域还剩多少账号没试（10 个国内号全 5xx 时
+	// 国际号也能轮到，不会把预算耗尽在首选域）。
+	realmTries := map[string]int{}
+	primaryQuota := h.cfg.MaxRotate - 1
+	if primaryQuota < 1 {
+		primaryQuota = 1
+	}
+	for i := 0; i < attempts; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
-				// 本次回落普通轮换。
+			if acct == nil || !realmAllowed(realmOrder, acct.Realm()) {
+				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或不在本请求
+				// 的跨域候选内 → 解绑，本次回落普通轮换。
 				unbindSticky()
 				acct = nil
 			}
 		}
 		if acct == nil {
+			// 跨域回落决策：每次选号前按候选顺序挑「有未试健康账号」的域
+			// （首选域耗尽 → 自动切另一域），realm_fallback 关闭时顺序只有首选域。
+			r := h.chooseRealm(realmOrder, realmBlocked, nil, bareModel, tried)
+			// 首选域配额：首选域尝试数已达上限且备选域仍有未试候选时，优先备选域。
+			if len(realmOrder) > 1 && realmTries[realmOrder[0]] >= primaryQuota {
+				if alt := h.chooseRealm(realmOrder, realmBlocked, map[string]bool{realmOrder[0]: true}, bareModel, tried); alt != "" {
+					r = alt
+				}
+			}
+			if r != "" {
+				realm = r
+			}
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
@@ -658,6 +804,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		st.uid = acct.UID
 		tried[acct.UID] = true
+		realmTries[acct.Realm()]++
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
@@ -778,6 +925,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+			// 11102「该账号无此模型」且该域目录明确没有 → 整域跳过（跨域回落立即生效）：
+			// 同域其余账号也会撞同一 11102，留在本域纯属浪费轮转。
+			// 目录有该模型/无目录数据时不整域跳过——11102 可能是账号级权限差异，
+			// 按 (账号, 模型) 负缓存继续域内轮换。
+			if kind == upstream.ErrModelBlocked && h.realmModelState(acct.Realm(), bareModel) == 0 {
+				realmBlocked[acct.Realm()] = true
+			}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：

@@ -12,7 +12,7 @@
 //
 // 知识表**一处定义、CN/global 两域共用**：context_length 是模型固有属性——fork
 // 706412584 实测结论「两区是同一套 API 的两次部署」，同 id 上下文一致，无按 realm
-// 分表必要（与 effort 档位的 realm 分表刻意不同）。
+// 分表必要（effort 档位表同口径：同 id 能力两域共用，国际版专有模型另行覆盖）。
 //
 // 值来源两类，逐条注释标注：
 //   - fork 实测：706412584 直连上游 /console/enterprises/personal/models 的

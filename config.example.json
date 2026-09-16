@@ -26,6 +26,7 @@
   },
   "global": {
     "enabled": true,
+    "realm_fallback": true,
     "chat_base": "",
     "billing_base": ""
   },

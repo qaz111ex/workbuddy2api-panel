@@ -24,3 +24,10 @@ func resolveModel(model string) (realm, bare string) {
 
 // ResolveModel 是 resolveModel 的导出面（跨包调用）。
 func ResolveModel(model string) (realm, bare string) { return resolveModel(model) }
+
+// HasRealmPrefix 报告模型名是否带显式 [realm:] 前缀（与 resolveModel 同一判定）。
+// 显式前缀是「首选域」表达，不再是硬钉：跨域回落开启时首选域不可用会切到另一域。
+func HasRealmPrefix(model string) bool {
+	_, bare := resolveModel(model)
+	return bare != model
+}

@@ -309,6 +309,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
+| `global.enabled` | `true` | global realm 路由总开关；`false` = 逃生门（纯 CN 锁定，`global:` 前缀失效） |
+| `global.realm_fallback` | `true` | **跨域回落**：首选域（`cn:` / `global:` 前缀，或裸名的默认域）没有可用账号时，自动改用另一域的同名模型账号继续服务，客户端无需因账号池变化修改模型名；`false` = 严格按前缀/默认域路由，不跨域 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
 | `schedule.travel_hours` | `[9, 21]` | 每日本地时区整点推进猫猫旅行状态机（领养 / 派出 / 领奖） |
 | `schedule.activity_hours` | `[10]` | 每日本地时区整点对话活跃上报（点亮连登 + 解锁 `first_buddy`） |
@@ -413,6 +415,21 @@ curl -s http://localhost:7863/v1/chat/completions \
    - `idleWeight` = `min(闲置小时 × idle_weight_per_hour, idle_weight_max)`，从未使用给满分
    - `successRate` = `successCount/(successCount+errTotal)`，无记录给中性 1.5
 4. 防惊群：跳过 100ms 内刚被选中的账号；全冷却时从非禁用、非余额耗尽的软冷却 / 熔断账号中选最早到期者顶班
+
+### 跨域回落（cn / global 账号互备）
+
+同一账号池可同时放国内版（CN）与国际版（global）账号。模型名**前缀不再是硬钉**：
+
+- 请求模型名 `global:deepseek-v4.1-flash`：首选国际版账号；**国际版账号全部冷却 / 在途占满 / 该域没有此模型时，自动改用国内版账号继续服务**（反之 `cn:xxx` 亦然）——客户端不需要因为账号池变化修改模型名
+- 裸模型名（如 `deepseek-v4.1-flash`）：CN 优先（现状零回归）；CN 目录明确没有该模型时直接走 global；纯国际版池自动全走 global
+- **国内版账号全部被禁用**（或全部冷却/限流/熔断）时，裸名请求直接由国际版账号服务；反之亦然
+- **首选域尝试配额**：首选域最多先试 `MaxRotate-1` 次（默认 2 次），之后把机会让给另一域——国内版有 5 个号全部 5xx 时，国际版号也能轮到，不会把轮转预算耗尽在首选域
+- 单请求轮转预算在有跨域候选且另一域确有账号时 +1，保证首选域账号试完后另一域仍有尝试机会
+- 是否回落以两端**模型目录**（`/v1/models` 探测缓存，零额外上游调用）为准：另一域目录确认没有该模型时不白跑一趟；目录数据不足时乐观尝试
+- 上游 11102（该域无此模型）且目录确认 → 整个域跳过，立即切另一域，不在同域逐号硬撞
+- 关闭：`global.realm_fallback: false`（严格按前缀/默认域路由）；`global.enabled: false` 为纯 CN 逃生门
+
+> **思考档位两域一致**：同名的国际版/国内版模型走同一后端，**档位能力相同**——网关静态档位表以国内版为基、国际版专有模型（`fast-model` / `gpt-5.6-*` 等）单独覆盖。上游模型 API 只回固定 `reasoning.effort`、不下发 `supportedEfforts`（issue #84 实测），所以档位完全由网关兜底表提供：如 `deepseek-v4.1-flash` = `low/high/max`（默认 `high`）、`hy4-preview` = `high`。
 
 ### 会话粘性
 
