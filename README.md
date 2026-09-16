@@ -18,6 +18,12 @@
 
 ---
 
+> **本仓库是自维护分支**：fork 自 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)。
+> 相对上游的增量集中在**国际版（global realm）账号链路**——面板「模型与档位」500、模型目录缺 `deepseek-v4.1-flash`、
+> 裸名调用 503、思考档位缺失/错误，并新增 **cn↔global 跨域回落**（账号池切换时客户端无需改模型名）。
+> 增量清单与 **Windows 单文件 exe 下载**（自包含，含 Web 面板）见
+> [**Releases**](https://github.com/qaz111ex/workbuddy2api-panel/releases/latest)。
+
 > **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
 > 在上游基础上重构了可视化运维层，并同步了上游全部功能更新。
 > 差异概览见 [与上游的差异](#-与上游的差异)；上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文与上游 README。
@@ -225,7 +231,9 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 ### 方式二：Windows 单文件运行（无需 Docker）
 
 ```powershell
-# 1) 下载 Release 中的 wb2api.exe，或从源码构建
+# 1) 直接下载本分支打包好的 wb2api.exe（免构建）：
+#    https://github.com/qaz111ex/workbuddy2api-panel/releases/latest
+#    或从源码构建：
 go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
 # 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
