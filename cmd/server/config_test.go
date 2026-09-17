@@ -568,18 +568,20 @@ func TestBalanceRefreshDefaults(t *testing.T) {
 	}
 }
 
-// TestMaxBodyDefault 默认 max_body_mb=8。
+// TestMaxBodyDefault 默认 max_body_mb=0（不限）：上游限制在 token 而非字节，
+// 缺省不设字节上限，避免把上游本来接受的请求（如 475k token 纯文本 ≈ 3.6MB，
+// 加内联图片后轻易破 8MB）先掐死。
 func TestMaxBodyDefault(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if c.Server.MaxBodyMB != 8 {
-		t.Errorf("max_body_mb=%d want 8", c.Server.MaxBodyMB)
+	if c.Server.MaxBodyMB != 0 {
+		t.Errorf("max_body_mb=%d want 0 (unlimited)", c.Server.MaxBodyMB)
 	}
 }
 
-// TestMaxBodyExplicit 显式设置 max_body_mb。
+// TestMaxBodyExplicit 显式设置 max_body_mb（正数 = 启用字节上限）。
 func TestMaxBodyExplicit(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -593,10 +595,24 @@ func TestMaxBodyExplicit(t *testing.T) {
 	}
 }
 
-// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成 8MB，
-// 与其误导不如 fail fast 提示显式配大上限。
+// TestMaxBodyZeroUnlimited 显式 0 = 不限（合法值，与缺省同义）。
+func TestMaxBodyZeroUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":0}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("0 must be accepted as unlimited: %v", err)
+	}
+	if c.Server.MaxBodyMB != 0 {
+		t.Errorf("max_body_mb=%d want 0", c.Server.MaxBodyMB)
+	}
+}
+
+// TestMaxBodyInvalid 非法值（负数）normalize 报错：负数既不表达"不限"也不表达
+// 某个上限，fail fast 而不是静默归一。
 func TestMaxBodyInvalid(t *testing.T) {
-	for _, v := range []string{"0", "-1"} {
+	for _, v := range []string{"-1", "-100"} {
 		dir := t.TempDir()
 		fp := filepath.Join(dir, "c.json")
 		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)

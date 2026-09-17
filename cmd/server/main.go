@@ -290,7 +290,9 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// 取值大于 MaxBodyMB 在常规带宽下的上传耗时；聊天请求体上限默认 8MB。
+		// max_body_mb 缺省为 0（不限）后，这里是请求体在**时间**维度的唯一约束：
+		// 60s 内传不完会得到连接错误（read timeout）而非 413。按常规带宽换算，
+		// 60s 可容纳的量级远超历史 8MB 默认，公网大请求可另配 max_body_mb 兜底。
 		ReadTimeout: 60 * time.Second,
 		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
 		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout

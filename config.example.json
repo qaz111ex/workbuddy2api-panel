@@ -4,7 +4,7 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "max_body_mb": 8
+    "max_body_mb": 0
   },
   "cooldown": {
     "soft_rate": "600s",

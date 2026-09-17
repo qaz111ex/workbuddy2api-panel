@@ -173,32 +173,32 @@ func TestChatOversizedBodyReturns413(t *testing.T) {
 	}
 }
 
-// TestChatOversizedBodyDefaultLimitHeader 未显式设置 MaxBodyBytes 时兜底 8MB：
-// 8MB+1 的请求体必须 413（不再静默截断喂给上游，issue #41 根因）。
-func TestChatOversizedBodyDefaultLimit(t *testing.T) {
+// TestChatOversizedBodyDefaultUnlimited 未注入 MaxBodyBytes 时缺省不限：
+// 8MB+1 的请求体也必须放行到上游（上游限制在 token 而非字节，见 Config 注释）。
+func TestChatOversizedBodyDefaultUnlimited(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 默认 8MB
+	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 缺省不限
 
-	body := make([]byte, 8<<20+1) // 8MB+1
+	body := make([]byte, 8<<20+1) // 8MB+1，旧默认下会被 413
 	copy(body, `{"model":"glm-5.2","messages":[]}`)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d want 413 (8MB+1 must be rejected)", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 (default is unlimited, no byte-level cap)", rec.Code)
 	}
-	if calls != 0 {
-		t.Errorf("upstream must not be called, got %d", calls)
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1 (oversized body must reach upstream)", calls)
 	}
 }
 
 // TestSetMaxBodyBytesHotApply 面板在线改 server.max_body_mb 必须即时生效（issue #17：
-// 改了配置却静默不生效，用户仍被旧上限 413）。同一请求体：调小后 413、调大后放行，
-// 全程不重建 handler。另覆盖 setter 的 <=0 兜底（回落 8MB）。
+// 改了配置却静默不生效，用户仍被旧上限 413）。同一请求体：调小后 413、调大后放行、
+// 设为 0 变回不限，全程不重建 handler。
 func TestSetMaxBodyBytesHotApply(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -227,13 +227,21 @@ func TestSetMaxBodyBytesHotApply(t *testing.T) {
 		t.Errorf("upstream calls = %d, want 1（放行后应恰好打一次）", calls)
 	}
 
-	// <=0 兜底回落 8MB：8MB+1 仍拒，8MB-1 放行。
+	// 0 = 不限：8MB+ 仍放行（不再回落 8MB 兜底）。
 	h.SetMaxBodyBytes(0)
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d want 413 (fallback 8MB, body > 8MB)", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 (0 = unlimited)", rec.Code)
+	}
+	// 负值归一为不限（不 panic、不回落旧 8MB）。
+	h.SetMaxBodyBytes(-5)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200 (negative normalized to unlimited)", rec.Code)
 	}
 }
 

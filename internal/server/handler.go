@@ -32,8 +32,10 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
-	// MaxBodyBytes 聊天请求体大小上限；<=0 兜底 8<<20（8MB）。
+	// MaxBodyBytes 聊天请求体大小上限（字节）。**0 = 不限（缺省）**，正数 = 启用。
 	// 超限直接 413 request_body_too_large（不再静默截断喂给上游，issue #41）。
+	// 缺省不限的理由见 cmd/server/config.go 的 MaxBodyMB 字段注释：上游限制在 token
+	// 而非字节，字节上限会把上游本来接受的请求先掐死。
 	MaxBodyBytes int64
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -118,14 +120,15 @@ type Handler struct {
 	// maxBodyBytes 请求体上限的运行期值（cfg.MaxBodyBytes 的原子镜像）。
 	// 面板在线改 server.max_body_mb 时经 SetMaxBodyBytes 热生效，无需重启
 	// （issue #17：改了配置却静默不生效，用户仍被 8MB 413 拦截）。
+	// 0 = 不限（跳过硬拦截分支，直接读满）。
 	maxBodyBytes atomic.Int64
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
-// n<=0 与 NewHandler 兜底口径一致：回落 8MB。
+// n<=0 = 不限（与 config 的 max_body_mb=0 同口径）。
 func (h *Handler) SetMaxBodyBytes(n int64) {
-	if n <= 0 {
-		n = 8 << 20
+	if n < 0 {
+		n = 0
 	}
 	h.maxBodyBytes.Store(n)
 }
@@ -144,8 +147,9 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	if cfg.MaxBodyBytes <= 0 {
-		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
+	// MaxBodyBytes 不做兜底：0 是合法值（不限，缺省语义），负值归一为 0。
+	if cfg.MaxBodyBytes < 0 {
+		cfg.MaxBodyBytes = 0
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
@@ -589,19 +593,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
 	clientIP := upstream.ExtractClientIP(r)
-	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
-	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
-	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
-	// 413 是网关侧的客户端问题，不打上游、不罚账号、不轮转。
+	// 请求体读取。limit > 0 时用 LimitReader 读 limit+1 探测"超限"（读到 limit+1
+	// 字节即已超）→ 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
+	// unmarshal 报 unexpected EOF，网关却罚号轮空）。413 是网关侧的客户端问题，
+	// 不打上游、不罚账号、不轮转。
+	// limit == 0（缺省）= 不限：直接读满，超限类问题交由上游自然答复（其限制在
+	// token 而非字节，见 Config.MaxBodyBytes 注释）。
 	limit := h.maxBodyBytes.Load()
-	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	var body []byte
+	var err error
+	if limit > 0 {
+		body, err = io.ReadAll(io.LimitReader(r.Body, limit+1))
+	} else {
+		body, err = io.ReadAll(r.Body)
+	}
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
-	if int64(len(body)) > limit {
+	if limit > 0 && int64(len(body)) > limit {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
-			fmt.Sprintf("请求体超过 %d MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试", limit>>20))
+			fmt.Sprintf("请求体超过 %d MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（设为 0 = 不限，面板修改即时生效）后重试", limit>>20))
 		return
 	}
 	var peek struct {

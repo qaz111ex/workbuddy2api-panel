@@ -314,7 +314,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
+| `server.max_body_mb` | `0` | 聊天请求体大小上限（MB）。**`0` = 不限（默认）**，正数 = 启用该上限（超限返回 **413 `request_body_too_large`**，不把半截请求喂给上游），负数启动报错。**面板在线修改即时生效**。默认不限的理由：上游的真实限制在 **token** 而非字节（超限返回 `11115`），字节上限会把上游本来接受的请求先掐死 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `global.enabled` | `true` | global realm 路由总开关；`false` = 逃生门（纯 CN 锁定，`global:` 前缀失效） |
@@ -407,7 +407,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
-请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。请求体的网关侧截断已由 `server.max_body_mb` 的 413 消灭，剩余的 `11101` 只可能是客户端发来的畸形 JSON。
+请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。网关不会对请求体做截断转发（那正是 `11101` 的典型来源），因此走到这里的 `11101` 只可能是客户端发来的畸形 JSON。
 
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
@@ -722,19 +722,22 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
 - **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
 
-### 多图会话请求体超限怎么办？
+### 请求体大小限制
 
-请求体超过 `server.max_body_mb`（默认 8 MB）时网关直接返回 `413 request_body_too_large`：
+`server.max_body_mb` **默认为 `0`（不限）**——网关不再对聊天请求体做字节级预拦截，超限类问题交由上游按其真实规则答复。
+
+- **上游的真实限制在 token 而非字节**：超限时返回 `11115`（`prompt is too long: N tokens > 1048576 maximum`），该错误由网关**原样透传**给客户端（不罚号、不轮转），带真实 token 数与上限值，信息量比网关自己算的字节数大得多
+- 为什么不能按字节设默认：字节与 token 并不对应。图片以 base64 内联后按 4/3 膨胀，且 agent 客户端每轮都会把**历史全部图片**重新塞进请求体；一个上游完全接受的 475k token 会话纯文本已约 3.6 MB，叠加几张截图就会突破旧的 8 MB 默认——**请求被网关掐死，却看不到上游本来会给出的答复**
+- 需要自我保护时（如公网暴露、不希望单请求占满内存）把 `server.max_body_mb` 设为正数（单位 MB）即恢复预拦截：
 
 ```json
-{"error":{"message":"请求体超过 8 MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试","type":"api_error","code":"request_body_too_large"}}
+{"error":{"message":"请求体超过 8 MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（设为 0 = 不限，面板修改即时生效）后重试","type":"api_error","code":"request_body_too_large"}}
 ```
 
-- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身的默认上限
-- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会破 8 MB
-- 收到 `413` 即表示是请求体本身超限：面板「配置 → 请求体上限」在线调大**保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
-- 上游真实上限未实测（8 MB 以上的请求从未穿过网关），建议按需调大（如 16 / 32），若上游回 413 再回调
-- 要么放行要么明确 `413`，网关不再把半截请求体喂给上游
+- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身设的上限
+- 面板「配置 → 请求体上限」在线修改**保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
+- 无论是否设上限，网关都不会把半截请求体喂给上游（截断的 JSON 会让上游报 11101 且被误罚号，见 issue #41）
+- 时间维度的兜底始终生效：`http.Server.ReadTimeout` 60s，超时得到连接错误而非 413
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
 
@@ -772,7 +775,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 断言 | 出处 |
 |---|---|
 | `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
-| 请求体上限默认 8 MB | `cmd/server/config.go:132`；413 判定与返回 `internal/server/handler.go:246-254` |
+| `server.max_body_mb` 默认 `0`（不限） | `cmd/server/config.go`（`Default()` 置 0、`normalize()` 仅拒负数）；413 判定与返回 `internal/server/handler.go` 的 `chatCompletions` 读 body 分支（`limit > 0` 时才启用） |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
