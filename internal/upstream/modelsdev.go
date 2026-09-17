@@ -339,15 +339,23 @@ func parseModelsDevDoc(raw []byte) (map[string]modelsDevEntry, error) {
 	for id, cs := range byModel {
 		best := 0
 		for i, c := range cs {
-			// 优先级：官方 vendor 源 > 票数众数 > provider 字典序（tie-break 确定性）。
+			// 优先级：官方 vendor 源 > 票数众数 > provider 字典序 > 聚合 key 字典序。
+			// 第四级 aggKey 是必要的收尾 tie-break：同一 provider 下可能有两个 fullID
+			// （如 gpt-x 与 openai/gpt-x）归一到同一裸 id 且 limit 不同，此时前三级
+			// (vendor, votes, minProvider) 完全相同——没有第四级仍会落到 map 迭代序，
+			// 同 binary 两次拉取同一文档可能落不同值进 model.json（/v1/models 抖动）。
 			cur := cs[best]
 			better := false
 			if c.vendor && !cur.vendor {
 				better = true
 			} else if c.vendor == cur.vendor && c.votes > cur.votes {
 				better = true
-			} else if c.vendor == cur.vendor && c.votes == cur.votes && c.minProvider < cur.minProvider {
-				better = true
+			} else if c.vendor == cur.vendor && c.votes == cur.votes {
+				if c.minProvider < cur.minProvider {
+					better = true
+				} else if c.minProvider == cur.minProvider && c.aggKey < cur.aggKey {
+					better = true
+				}
 			}
 			if better {
 				best = i

@@ -50,6 +50,12 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// weightOfHook / weightOfMaxHook 仅供测试观测（DeptestOnly）：分别统计 weightOf
+	// 被调次数与收到的 maxCredits 口径，验证「单次 pick 只算一次 + 全集口径」的重构
+	// 契约（TestWeightOfCalledOncePerPick / TestWeightOfMaxCreditsPassedVerbatim）。
+	// 生产恒 nil，零开销（nil 函数调用分支预测友好）。
+	weightOfHook    func()
+	weightOfMaxHook func(maxCredits int64)
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64

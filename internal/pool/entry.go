@@ -199,7 +199,8 @@ type entry struct {
 	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
 	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
 	// 单 until 字段做不到的）。仅 6004 触发时记录；空 map = 无模型级限流（不豁免）。
-	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
+	// 已持久化（stateAccount.ModelCooldowns → stateModelCooldown）：落盘/恢复往返
+	// 无损（Until/ResetAt/Reason 三字段；Hits 不落盘，见 modelCooldown 注释）。
 	modelCooldowns map[string]modelCooldown
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。

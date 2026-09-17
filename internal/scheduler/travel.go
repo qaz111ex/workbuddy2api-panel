@@ -50,7 +50,7 @@ func (s *Scheduler) RunTravelNow() {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(logfmt.Label(st.UID, st.Nickname))
+		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
@@ -128,7 +128,7 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 // 不是账号问题（report.go 注释亦明确「解锁 first_buddy 任务（领养前置）」）。
 // conversation 门槛未达标仍属预期行为，记一次当日已试后静默跳过，不再重试。
 func (s *Scheduler) travelAdopt(a *auth.Auth) {
-	if s.adoptTriedToday(logfmt.Label(a.UID, a.Nickname)) {
+	if s.adoptTriedToday(a.UID) {
 		return
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
@@ -146,7 +146,7 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 	case err == nil:
 		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.Nickname))
 	case upstream.IsBuddyTaskIncomplete(err):
-		s.markAdoptTried(logfmt.Label(a.UID, a.Nickname))
+		s.markAdoptTried(a.UID)
 		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.Nickname))
 	default:
 		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.Nickname), err)

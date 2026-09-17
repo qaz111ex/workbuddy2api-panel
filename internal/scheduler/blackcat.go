@@ -21,7 +21,7 @@ func (s *Scheduler) RunBlackcatNow() {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(logfmt.Label(st.UID, st.Nickname))
+		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}

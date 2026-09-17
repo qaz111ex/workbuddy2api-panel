@@ -62,7 +62,9 @@ func Append(body []byte, systemPrompt string) []byte {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		// obj == nil 覆盖 JSON 字面量 null：Unmarshal 成功但 map 为 nil，
+		// 后续 obj[...] 赋值会 panic（assignment to entry in nil map）。
 		return body
 	}
 	msgs, ok := obj["messages"].([]any)
@@ -113,7 +115,8 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 		return body
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		// obj == nil 覆盖 JSON 字面量 null（同 Append 的守卫）。
 		return body
 	}
 	msgs, ok := obj["messages"].([]any)

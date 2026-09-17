@@ -11,9 +11,9 @@ import (
 // SetCredits 只更新账号余额总量与总额，不动快过架子集（creditsExpiring）——
 // 上游未回报分桶时的兼容入口，语义与 SetCreditsDetailed 的区别由
 // expiring_test.go:TestSetCreditsLeavesExpiringUnchanged 锚定。
-// DeptestOnly: 全库仅测试引用；生产写余额全走 SetCreditsDetailed
-// （scheduler.go 签到时调用），本入口无生产调用方。保留是因为它是「总量更新」
-// 与「总量+分桶更新」的语义对照锚点（删掉则 expiring 的向后兼容行为失去断言）。
+// 调用方：面板手动刷余额（panel.go accountCheckin/accountBalance 路径）与测试；
+// 生产签到路径走 SetCreditsDetailed（scheduler.go，带 expiring 分桶）。
+// 保留本入口是因为它是「总量更新」与「总量+分桶更新」的语义对照锚点。
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

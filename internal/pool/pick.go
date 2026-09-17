@@ -189,9 +189,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
 	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入。
 	eligible := make([]*entry, 0, len(cands))
+	eligibleW := make([]float64, 0, len(cands)) // 与 eligible 平行的预计算权重（避免 pickWeighted 重算）
+	weightOfEntry := make(map[*entry]float64, len(ws))
+	for _, wc := range ws {
+		weightOfEntry[wc.e] = wc.w
+	}
 	for _, e := range cands {
 		if now.Sub(e.lastUsed) >= minPickGap {
 			eligible = append(eligible, e)
+			eligibleW = append(eligibleW, weightOfEntry[e])
 		}
 	}
 	var e *entry
@@ -207,7 +213,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			}
 		}
 	} else {
-		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+		e = p.pickWeightedPrecomputed(eligible, eligibleW) // eligible 保序 = top5 降序子集
 	}
 	if explored {
 		// 探索事件日志：选中号此时才确定，故在选中点打出。
@@ -298,11 +304,20 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 			maxCredits = e.credits
 		}
 	}
+	weightsF := make([]float64, len(cands))
+	for i, e := range cands {
+		weightsF[i] = p.weightOf(e, maxCredits, now)
+	}
+	return p.pickWeightedPrecomputed(cands, weightsF)
+}
+
+// pickWeightedPrecomputed 用调用方**预计算**的权重抽签（单次 pick 内 weightOf 只算一次
+// 的契约：pick 的 ws 构建已按全集口径算过，此处不重算——maxCredits 口径也因此恒为全集）。
+func (p *Pool) pickWeightedPrecomputed(cands []*entry, weightsF []float64) *entry {
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 	weights := make([]int64, len(cands))
 	var total int64
-	for i, e := range cands {
-		w := p.weightOf(e, maxCredits, now)
+	for i, w := range weightsF {
 		weights[i] = int64(w * scale)
 		total += weights[i]
 	}
@@ -326,6 +341,12 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 
 // weightOf 计算单个账号的三因子权重。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+	if p.weightOfHook != nil {
+		p.weightOfHook() // DeptestOnly 观测：验证单次 pick 只算一次
+	}
+	if p.weightOfMaxHook != nil {
+		p.weightOfMaxHook(maxCredits) // DeptestOnly 观测：验证全集口径
+	}
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
 	if maxCredits > 0 {

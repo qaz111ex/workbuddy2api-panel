@@ -772,6 +772,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">系统提示词模式</span>
                 <select name="prompt_mode">
                   <option value="custom">custom — 网关自有提示词（避免指纹误报）</option>
+                  <option value="append">append — 两者并用（保留客户端 system，后插网关提示词）</option>
                   <option value="passthrough">passthrough — 透传客户端原始 system</option>
                 </select>
                 <span class="hint">需重启</span></label>

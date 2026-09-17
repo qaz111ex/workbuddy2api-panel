@@ -200,7 +200,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if at := a.AccessTokenValue(); at != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+		req.Header.Set("Authorization", "Bearer "+at)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}

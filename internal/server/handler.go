@@ -207,6 +207,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	if redisMode == "" {
 		redisMode = "noop"
 	}
+	// cost_explore 探索台账（issue #136 §5 可观测性）：累计探索事件数 + 各
+	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
+	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
+	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
@@ -219,6 +223,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"realm_totals": map[string]map[string]int{
 			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
 			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
+		},
+		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
+		"cost_explore": map[string]any{
+			"events_total": exploreEvents,
+			"per_model":    exploreLast,
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
@@ -715,11 +724,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
 	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
+	//   - append：开头连续 system/developer 块后插自有提示词，既有消息逐字不动
+	//     （客户端项目规范/工具约定与网关提示词并用）。
 	//   - passthrough 非降级期：透传客户端原始 system（不改写）。
+	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
+	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救。
 	degradedApplied := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "passthrough" && h.degrade.Active() {
+	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+		body = prompt.Append(body, h.cfg.PromptText)
+	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
 	}
@@ -882,9 +897,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试。
+			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
+			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
+			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
-			if kind == upstream.ErrContentBlocked && h.cfg.PromptMode == "passthrough" && !degradedApplied {
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true
@@ -975,7 +993,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
 				// 502 观测没有意义）。
 				st.status = http.StatusBadGateway
-				log.Printf("WARN: [server] stream uid=%s model=%s: empty upstream stream (200+0 frames)", logfmt.UID8(acct.UID), bareModel)
+				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
 			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
 			st.ttfb = stats.TTFB()
@@ -995,7 +1013,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else if hasUsage {
 				// 观测防护：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
-				log.Printf("WARN: [server] stream usage without credit uid=%s model=%s (no cost observation)", logfmt.UID8(acct.UID), bareModel)
+				log.Printf("WARN: [server] stream usage without credit acct=%s model=%s (no cost observation)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
 			rc.Close()
 			return

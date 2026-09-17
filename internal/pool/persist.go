@@ -57,7 +57,12 @@ func (p *Pool) RestoreFromSnapshot() {
 	}
 	var snap snapshot
 	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
-		// 快照无 savedAt：无法比较新旧，本地优先。
+		// 快照不可用（解析失败 / 无 savedAt）：无法比较新旧，本地优先。
+		// 本地也不可用时如实说明（不谎称"恢复来源=本地"——本地文件并不存在）。
+		if localErr != nil {
+			log.Printf("pool: 恢复来源=无（Redis 快照不可用且本地 state.json 不可用: %v）", localErr)
+			return
+		}
 		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
 	}
@@ -146,7 +151,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:          s.Credits,
 			creditsTotal:     s.CreditsTotal,
-			creditsExpiring:  s.CreditsExpiring,
+			creditsExpiring:  clampExpiring(s.CreditsExpiring, s.Credits), // 钳 [0, credits]，防手工脏数据放大 ×8 权重项
 			disabled:         s.Disabled,
 			reason:           s.Reason,
 			until:            s.Until,
@@ -323,4 +328,16 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		sf.Accounts[uid] = s
 	}
 	return sf
+}
+
+// clampExpiring 把快过期子集钳到 [0, credits]：恢复路径与 SetCreditsDetailed
+// 同口径，防手工编辑 state.json 的脏数据（expiring>credits 或负数）放大权重 ×8 项。
+func clampExpiring(expiring, credits int64) int64 {
+	if expiring < 0 {
+		return 0
+	}
+	if expiring > credits {
+		return credits
+	}
+	return expiring
 }

@@ -1559,17 +1559,23 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
-		var r, size int64
-		switch {
-		case acct.CycleCapacitySize > 0:
-			r, size = acct.CycleCapacityRemain, acct.CycleCapacitySize
-		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			r, size = acct.CycleCapacityRemain, acct.CycleCapacitySize
-		default:
-			r, size = acct.CapacityRemain, acct.CapacitySize
-		}
+		// 单套餐取数统一到 packageRemainUsed（与 ResourceSummary/cmd/credit 同一事实来源，
+		// 含 remain 钳 [0,size] 与 used 修正）：旧中间 switch 只钳负值，上游脏数据
+		// CycleRemain>Size 时会高估 remain。
+		r, _, _ := packageRemainUsed(respAccount{
+			CapacityRemain:      acct.CapacityRemain,
+			CapacityUsed:        acct.CapacityUsed,
+			CapacitySize:        acct.CapacitySize,
+			CycleCapacityRemain: acct.CycleCapacityRemain,
+			CycleCapacityUsed:   acct.CycleCapacityUsed,
+			CycleCapacitySize:   acct.CycleCapacitySize,
+		})
 		if r < 0 {
 			r = 0
+		}
+		size := acct.CycleCapacitySize
+		if size <= 0 {
+			size = acct.CapacitySize
 		}
 		if size < r {
 			size = r
@@ -1586,6 +1592,48 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		}
 	}
 	return remain, total, expiring, nil
+}
+
+// respAccount 单套餐的六个容量字段（get-user-resource 响应条目）。
+type respAccount struct {
+	CapacityRemain      int64
+	CapacityUsed        int64
+	CapacitySize        int64
+	CycleCapacityRemain int64
+	CycleCapacityUsed   int64
+	CycleCapacitySize   int64
+}
+
+// packageRemainUsed 聚合单套餐的 remain/used/size（单一事实来源）。
+// Cycle 期套餐优先：用 CycleCapacity 三字段，used 取 CycleUsed 与 size-remain 的
+// 较大者，remain 钳到 [0,size]（上游脏数据 CycleRemain>Size 时防高估）；
+// 否则回退 Capacity 三字段（used 缺失时按 size-remain 推算）。
+func packageRemainUsed(a respAccount) (remain, used, size int64) {
+	if a.CycleCapacitySize > 0 {
+		remain = a.CycleCapacityRemain
+		size = a.CycleCapacitySize
+		if remain < 0 {
+			remain = 0
+		}
+		if remain > size {
+			remain = size
+		}
+		used = size - remain
+		if a.CycleCapacityUsed > used {
+			used = a.CycleCapacityUsed
+			if size >= used {
+				remain = size - used
+			}
+		}
+		return remain, used, size
+	}
+	remain = a.CapacityRemain
+	used = a.CapacityUsed
+	size = a.CapacitySize
+	if used == 0 && size > remain {
+		used = size - remain
+	}
+	return remain, used, size
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
