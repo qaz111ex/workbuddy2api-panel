@@ -334,7 +334,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
-| `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
+| `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头 system/developer 块后插入网关 system（两者并用）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
@@ -346,6 +346,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
 | `pool.idle_weight_per_hour` | `0.5` | 闲置补偿：每小时未使用 +0.5 权重 |
 | `pool.idle_weight_max` | `5.0` | 闲置补偿权重封顶 |
+| `pool.cost_explore_interval` | `30m` | 成本分层「条件探索」窗口：tier0（实测免费）垄断时，每隔该窗口把一个既有请求改道给未知号以探测其费率（搭车改道，零新增上游请求；成功即毕业）。`"0"` 关停 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
@@ -378,6 +379,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 模式 | 语义 |
 |---|---|
 | `custom`（默认） | 出站前用网关自有提示词**替换**客户端 system / developer 消息（删除全部 system / developer，头部插入单条 system）；user / assistant / tool 消息逐字不动 |
+| `append` | **两者并用**：在开头连续 system / developer 块之后**插入**一条网关 system，既有消息（含客户端项目规范 / 工具约定）逐字不动；降级期与拦截首遇重试时退化为 `custom` 语义（换中性提示词） |
 | `passthrough` | 透传客户端原始 system，不做改写 |
 
 内置默认提示词约 2KB（`internal/prompt/defaultprompt.md`，嵌入二进制）。`prompt.file` 指向自定义提示词文件（自定义人格 / 人设）即整体替换内置默认；**留空 = 内置默认**，路径非空但不可读 → **启动报错**（fail fast，不会静默回落到内置默认）。
