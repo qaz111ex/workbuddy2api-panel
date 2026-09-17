@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -323,8 +324,8 @@ func (s *Scheduler) RunCheckinNow() {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		a := s.cfg.Pool.AuthByUID(logfmt.Label(st.UID, st.Nickname))
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
 		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
@@ -336,9 +337,9 @@ func (s *Scheduler) RunCheckinNow() {
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
-				log.Printf("checkin %s: 今天已签到（幂等）", st.UID)
+				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
 			} else {
-				log.Printf("checkin %s: %v", st.UID, err)
+				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			}
 			// 其余业务错误也继续走余额查询
 		}
@@ -346,7 +347,7 @@ func (s *Scheduler) RunCheckinNow() {
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
 		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
-			log.Printf("user-resource %s: %v", st.UID, err)
+			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
@@ -376,8 +377,8 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		a := s.cfg.Pool.AuthByUID(logfmt.Label(st.UID, st.Nickname))
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		if a.IsGlobal() {
@@ -391,7 +392,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
-			log.Printf("activity %s: %v", a.UID, err)
+			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 			continue
 		}
 		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
@@ -408,14 +409,14 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("activity %s: streak check failed (report OK): %v", a.UID, err)
+		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.Nickname), err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", a.UID)
+		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.Nickname))
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", a.UID, days)
+	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.Nickname), days)
 	return false
 }
 
@@ -428,23 +429,23 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		a := s.cfg.Pool.AuthByUID(logfmt.Label(st.UID, st.Nickname))
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", st.UID, err)
+			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", st.UID, pool.SessionDeadThreshold())
+				if s.cfg.Pool.NoteSessionDead(logfmt.Label(st.UID, st.Nickname)) {
+					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
 			}
 			continue
 		}
-		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+		s.cfg.Pool.ClearSessionDead(logfmt.Label(st.UID, st.Nickname)) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", st.UID, err)
+			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
 }
@@ -459,7 +460,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
+		a := s.cfg.Pool.AuthByUID(logfmt.Label(st.UID, st.Nickname))
 		if a == nil {
 			continue
 		}
@@ -476,7 +477,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			} else {
 				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			}
-		}(a, st.UID)
+		}(a, logfmt.Label(st.UID, st.Nickname))
 	}
 	wg.Wait()
 }

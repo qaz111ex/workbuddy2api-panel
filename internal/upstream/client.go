@@ -949,7 +949,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {
 			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
@@ -963,12 +963,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
 			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
 			if rerr != nil {
-				log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
+				log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v", logfmt.Label(a.UID, a.Nickname), rerr)
 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 			}
 			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
+				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
 			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
 			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
 				continue
@@ -1203,7 +1203,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -1320,7 +1320,7 @@ func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults m
 // v3ConfigDomain /v3/config 的 X-Domain：优先账号落盘 domain，否则 chatBase host。
 func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	if a != nil {
-		if d := strings.TrimSpace(a.Domain); d != "" {
+		if d := strings.TrimSpace(a.DomainValue()); d != "" {
 			d = strings.TrimPrefix(d, "https://")
 			d = strings.TrimPrefix(d, "http://")
 			return strings.TrimSuffix(d, "/")
@@ -1341,7 +1341,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	if a != nil && a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
@@ -1512,13 +1512,19 @@ func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 	return remain, total, err
 }
 
-// packageEndLayout 上游套餐到期时间的墙钟格式（UTC+8，与 softRateResetLoc 同口径）。
+// packageEndLayout 上游 CycleEndTime / 请求体过滤串的时间格式（墙钟，UTC+8，
+// 与 softRateResetLoc 同口径）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
-// soon > 0 且套餐 PackageEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
-// （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
-// 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
+// soon > 0 且套餐到期时间（CycleEndTime）解析成功且到期时刻 ≤ now+soon 的余额计入
+// expiring（pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时
+// expiring 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
+//
+// 到期判据是 CycleEndTime：实测 CN/global 两域字段全集均无 PackageEndTime，旧判据
+// 恒 miss 导致 Expiring 恒 0（分桶形同虚设）；CycleEndTime 才是上游真实下发的到期
+// 时刻（global Bonus Pack 14 天赠送积分的到期时间即此字段）。解析失败/缺失的套餐
+// 保守归入 Stable（不误标为快过期而插队）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
 	now := time.Now()
 	body := map[string]any{
@@ -1538,7 +1544,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 			Data struct {
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
-					PackageEndTime      string `json:"PackageEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
+					CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
 					CapacityUsed        int64  `json:"CapacityUsed"`
@@ -1571,8 +1577,8 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		remain += r
 		total += size
 		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.PackageEndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.PackageEndTime, softRateResetLoc); perr == nil {
+		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
+			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
 				if !end.After(now.Add(soon)) {
 					expiring += r
 				}
@@ -1604,10 +1610,5 @@ func IsAlreadyCheckin(err error) bool {
 	return false
 }
 
-func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
-}
+// truncate 保留包内旧名，转调 logfmt.Truncate（rune 边界安全 + n<=0 守卫）。
+func truncate(s string, n int) string { return logfmt.Truncate(s, n) }
