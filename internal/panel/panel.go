@@ -12,14 +12,17 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -242,40 +245,85 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
 // 无可用账号 503（先添加账号）；上游失败 502。
+//
+// **双域分流**（吸收 upstream c3cc888 的修复项）：CN 与 global 各自从
+// AvailableUIDsForRealm 取可用账号、独立探测、独立容错，一次查询同时输出两域。
+//
+// 为什么不能「Pool.Pick() 选中谁就查谁」：Pick 只返回一个账号，于是混合池上
+// 面板只显示**恰好被选中的那一域**的模型，另一域静默消失（纯 global 池则必炸）；
+// 而模型名带 cn:/global: 前缀的语义本身就是"两域模型都可调用"——只列一域会让
+// 用户看不到另一半可用的模型名。某域无账号则整域跳过，两域全空才报错。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	acct := p.cfg.Pool.Pick()
-	if acct == nil {
-		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+	type realmProbe struct {
+		realm  string
+		prefix string
+		fetch  func(acct *auth.Auth) ([]upstream.ModelInfo, error)
+	}
+	probes := []realmProbe{
+		{
+			realm: "cn", prefix: "cn:",
+			fetch: func(acct *auth.Auth) ([]upstream.ModelInfo, error) {
+				return p.cfg.Upstream.FetchModels(acct)
+			},
+		},
+	}
+	if p.cfg.Upstream.GlobalEnabled {
+		probes = append(probes, realmProbe{
+			realm: "global", prefix: "global:",
+			fetch: func(acct *auth.Auth) ([]upstream.ModelInfo, error) {
+				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
+				if len(infos) == 0 {
+					// 窄表形态（上游只给 ID 名单）→ 按 ID 输出裸条目，窗口/档位走兜底链。
+					for _, id := range p.cfg.Upstream.FetchGlobalModels(acct) {
+						infos = append(infos, upstream.ModelInfo{ID: id})
+					}
+				}
+				if len(infos) == 0 {
+					return nil, errors.New("上游未返回可用模型")
+				}
+				return infos, nil
+			},
+		})
+	}
+
+	out := make([]map[string]any, 0)
+	errs := make([]string, 0)
+	anyAccount := false
+	for _, pr := range probes {
+		uids := p.cfg.Pool.AvailableUIDsForRealm(pr.realm)
+		if len(uids) == 0 {
+			continue // 该域无可用账号：整域跳过（不是错误）
+		}
+		anyAccount = true
+		acct := p.cfg.Pool.AuthByUID(uids[0])
+		if acct == nil {
+			errs = append(errs, pr.realm+": 账号已失效")
+			continue
+		}
+		infos, err := pr.fetch(acct)
+		if err != nil {
+			errs = append(errs, pr.realm+": "+err.Error())
+			continue
+		}
+		out = append(out, p.modelEntries(pr.realm, pr.prefix, infos)...)
+	}
+
+	if len(out) == 0 {
+		if !anyAccount {
+			writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+			return
+		}
+		writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(errs, "; "))
 		return
 	}
-	// 按账号 realm 分流：国际版账号必须走 global 目录探测。此前不分流时它会被送去
-	// CN 的 /console/enterprises/personal/models，而该路径在国际版 base 上返回 500
-	// HTML——这是国际版账号打开本页必报 500 的根因。
-	// id 带上网关路由前缀：前端显示的就是调用时要填的完整模型名（裸名会被当作 CN 路由）。
-	realm := acct.Realm()
-	modelPrefix := "cn:"
-	var infos []upstream.ModelInfo
-	if acct.IsGlobal() {
-		modelPrefix = "global:"
-		infos = p.cfg.Upstream.FetchGlobalModelInfos(acct)
-		if len(infos) == 0 {
-			// 窄表形态（上游只给 ID 名单）→ 按 ID 输出裸条目，窗口/档位走兜底链。
-			for _, id := range p.cfg.Upstream.FetchGlobalModels(acct) {
-				infos = append(infos, upstream.ModelInfo{ID: id})
-			}
-		}
-		if len(infos) == 0 {
-			writeErr(w, http.StatusBadGateway, "fetch global models: 上游未返回可用模型")
-			return
-		}
-	} else {
-		var err error
-		infos, err = p.cfg.Upstream.FetchModels(acct)
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
-			return
-		}
-	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// modelEntries 把某域探测到的模型列表转成面板条目（id 带 realm 前缀）。
+//
+// id 带上网关路由前缀：前端显示的就是调用时要填的完整模型名（裸名会被当作 CN 路由）。
+// 查询链本身用裸名（mi.ID）——前缀是网关侧路由协议，上游只认裸名。
+func (p *Panel) modelEntries(realm, modelPrefix string, infos []upstream.ModelInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
 		entry := map[string]any{
@@ -315,7 +363,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	return out
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
