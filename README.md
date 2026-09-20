@@ -174,7 +174,7 @@ flowchart LR
     Client["客户端 / SDK\nOpenAI 兼容请求"] --> H
 
     subgraph GWI["WorkBuddy2API 网关 :7863"]
-        H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
+        H["HTTP Handler\n鉴权 · 提示词改写 · 轮转"] --> P
         H --> S
         P["账号池\n三因子加权 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
@@ -314,7 +314,6 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `server.max_body_mb` | `0` | 聊天请求体大小上限（MB）。**`0` = 不限（默认）**，正数 = 启用该上限（超限返回 **413 `request_body_too_large`**，不把半截请求喂给上游），负数启动报错。**面板在线修改即时生效**。默认不限的理由：上游的真实限制在 **token** 而非字节（超限返回 `11115`），字节上限会把上游本来接受的请求先掐死 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `global.enabled` | `true` | global realm 路由总开关；`false` = 逃生门（纯 CN 锁定，`global:` 前缀失效） |
@@ -365,7 +364,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
 ## 核心行为语义
 
@@ -547,7 +546,7 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体无网关侧大小上限 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -724,20 +723,13 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 请求体大小限制
 
-`server.max_body_mb` **默认为 `0`（不限）**——网关不再对聊天请求体做字节级预拦截，超限类问题交由上游按其真实规则答复。
+网关**不设任何请求体大小上限**（`server.max_body_mb` 配置键与 `WB2A_MAX_BODY_MB` 环境变量已**彻底移除**，对齐上游 `e34cfa4`/`a0aae43`）。任意大小的请求体都会完整读入并转发上游，超限类问题由上游按其真实规则答复。
 
 - **上游的真实限制在 token 而非字节**：超限时返回 `11115`（`prompt is too long: N tokens > 1048576 maximum`），该错误由网关**原样透传**给客户端（不罚号、不轮转），带真实 token 数与上限值，信息量比网关自己算的字节数大得多
-- 为什么不能按字节设默认：字节与 token 并不对应。图片以 base64 内联后按 4/3 膨胀，且 agent 客户端每轮都会把**历史全部图片**重新塞进请求体；一个上游完全接受的 475k token 会话纯文本已约 3.6 MB，叠加几张截图就会突破旧的 8 MB 默认——**请求被网关掐死，却看不到上游本来会给出的答复**
-- 需要自我保护时（如公网暴露、不希望单请求占满内存）把 `server.max_body_mb` 设为正数（单位 MB）即恢复预拦截：
-
-```json
-{"error":{"message":"请求体超过 8 MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（设为 0 = 不限，面板修改即时生效）后重试","type":"api_error","code":"request_body_too_large"}}
-```
-
-- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身设的上限
-- 面板「配置 → 请求体上限」在线修改**保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
-- 无论是否设上限，网关都不会把半截请求体喂给上游（截断的 JSON 会让上游报 11101 且被误罚号，见 issue #41）
-- 时间维度的兜底始终生效：`http.Server.ReadTimeout` 60s，超时得到连接错误而非 413
+- 为什么不能按字节设上限：字节与 token 并不对应。图片以 base64 内联后按 4/3 膨胀，且 agent 客户端每轮都会把**历史全部图片**重新塞进请求体；一个上游完全接受的 475k token 会话纯文本已约 3.6 MB，叠加几张截图就会突破旧的 8 MB 默认——**请求被网关掐死，却看不到上游本来会给出的答复**
+- 旧配置里的 `"server": {"max_body_mb": N}` 键与 `WB2A_MAX_BODY_MB` 环境变量会被**静默忽略**（JSON 未知键容忍），不影响启动；不再有任何可观察的配置面
+- 客户端中途断流导致的半截请求体在读入阶段即报 `400 invalid_request`，**不会**把截断的 JSON 喂给上游（截断的 JSON 会让上游报 11101 且被误罚号，见 issue #41）——该防御语义保留在读错误路径
+- 时间维度的约束始终生效：`http.Server.ReadTimeout` 60s，超时得到连接错误而非 413
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
 
@@ -775,7 +767,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 断言 | 出处 |
 |---|---|
 | `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
-| `server.max_body_mb` 默认 `0`（不限） | `cmd/server/config.go`（`Default()` 置 0、`normalize()` 仅拒负数）；413 判定与返回 `internal/server/handler.go` 的 `chatCompletions` 读 body 分支（`limit > 0` 时才启用） |
+| `server.max_body_mb` 已移除（请求体无网关侧上限） | `cmd/server/config.go`（`Server` 段与 `WB2A_MAX_BODY_MB` 均已删除，旧键静默忽略）；`internal/server/handler.go` 的 `chatCompletions` 直接 `io.ReadAll(r.Body)` |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |

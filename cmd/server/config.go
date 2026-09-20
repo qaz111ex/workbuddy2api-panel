@@ -22,22 +22,22 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
-	Server struct {
-		// MaxBodyMB 聊天请求体大小上限（单位 MB）。**0 = 不限（默认）**，正数 = 启用该上限。
-		//
-		// 为什么默认不限：上游的真实限制在 **token** 而非字节（超限返回 11115
-		// "prompt is too long: N tokens > 1048576 maximum"），而字节上限与 token
-		// 上限并不对应——图片以 base64 内联后按 4/3 膨胀、且长会话每轮重复发送历史，
-		// 因而一个上游完全接受的请求（如 475k token 纯文本 ≈ 3.6MB，加图后轻易破 8MB）
-		// 会被网关的字节上限先掐死，反而看不到上游的真实答复。
-		//
-		// 为什么保留这个开关：无上限读入意味着内存占用由客户端单请求决定，公网暴露
-		// 时可用它作为自我保护的闸门（也是历史上 8MB 默认的初衷）。设为正数即恢复
-		// 413 request_body_too_large 预拦截（该分支保留，不静默截断喂上游——issue #41：
-		// 截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
-		// 负数视为非法 → normalize 报错。
-		MaxBodyMB int `json:"max_body_mb"`
-	} `json:"server"`
+	// server.max_body_mb 与 WB2A_MAX_BODY_MB 已**彻底移除**（不再读取、不再生效）。
+	//
+	// 移除理由：字节上限与上游的真实限制不对应。上游限制在 **token** 而非字节
+	// （超限返回 11115 "prompt is too long: N tokens > 1048576 maximum"），而图片
+	// base64 内联膨胀 4/3、长会话每轮重发历史，导致一个上游完全接受的请求
+	// （如 475k token 纯文本 ≈ 3.6MB，加图后轻易破 8MB）被网关自己的 413 先掐死
+	// ——用户看不到上游本来会给出的答复，却以为是上游拒绝。
+	//
+	// 保留开关（此前 1.12.1 的做法：键保留、默认 0）经评估仍属多余：一个几乎无人
+	// 使用的配置项，却要让用户理解"字节 vs token"的区别，且面板上摆着一个默认
+	// 关闭、开启后只会造成困惑的字段。**彻底删除**后语义唯一：请求体完整读入并转发，
+	// 超限类问题一律由上游按其真实规则答复（错误经既有分类链路透传）。
+	//
+	// 旧配置里的 "server": {"max_body_mb": N} 键被 JSON 未知字段静默忽略，
+	// 不影响启动（与上游 e34cfa4/a0aae43 的 BREAKING 处理一致）。
+	// 内存兜底改由 ReadTimeout（时间维度）与上游 token 限制共同承担。
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -201,8 +201,6 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
-	// MaxBodyMB 缺省 0 = 不限（默认不再设字节上限，见字段注释：上游限制在 token 而非字节）。
-	c.Server.MaxBodyMB = 0
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -340,11 +338,6 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
-	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Server.MaxBodyMB = n
-		}
-	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -407,12 +400,6 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
-	// max_body_mb 语义：0 = 不限（默认），正数 = 启用字节上限；负数非法。
-	// 与上游「不做字节级限制」的取舍对齐（限制在 token，见字段注释）；负数没有
-	// 合理语义（既不表达"不限"也不表达"某个上限"），fail fast 而不是静默归一。
-	if c.Server.MaxBodyMB < 0 {
-		return fmt.Errorf("server.max_body_mb: %d 非法（0 = 不限，正数 = 上限 MB）", c.Server.MaxBodyMB)
-	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}

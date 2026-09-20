@@ -229,11 +229,6 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
-	// chatHandler 前置声明：panel 的 SaveConfig 闭包要拿到 handler 以热应用
-	// server.max_body_mb，而 handler 的 Config.Panel 又依赖 pn——装配循环用
-	// 变量前置 + saveConfig 内 nil 保护解开（SaveConfig 只在请求期被调，彼时
-	// handler 必已就位）。
-	var chatHandler *server.Handler
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -253,7 +248,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch, chatHandler)
+			return saveConfig(raw, *cfgPath, live, p, up, sch)
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -276,9 +271,7 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 跨域回落：首选域账号耗尽时自动改用另一域的同名模型账号（缺省 true）。
 		RealmFallback: cfg.Global.RealmFallback,
-		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
-	chatHandler = h
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -290,9 +283,9 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// max_body_mb 缺省为 0（不限）后，这里是请求体在**时间**维度的唯一约束：
-		// 60s 内传不完会得到连接错误（read timeout）而非 413。按常规带宽换算，
-		// 60s 可容纳的量级远超历史 8MB 默认，公网大请求可另配 max_body_mb 兜底。
+		// 请求体已无网关侧大小上限（server.max_body_mb 已彻底移除），这里是请求体
+		// 在**时间**维度的唯一约束：60s 内传不完会得到连接错误（read timeout）而非
+		// 413。按常规带宽换算，60s 可容纳数十 MB 量级的上传余量。
 		ReadTimeout: 60 * time.Second,
 		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
 		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
@@ -331,7 +324,6 @@ func panelListenPath(listen string) string {
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
-//   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
@@ -339,7 +331,7 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, srv *server.Handler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -394,11 +386,6 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
-	// srv 为 nil 仅出现在装配未完成的窗口（SaveConfig 只在请求期被调，理论不可达），
-	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
-	if srv != nil {
-		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
-	}
 
 	return restartRequiredFields(newCfg), nil
 }

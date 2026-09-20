@@ -110,140 +110,61 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	return p
 }
 
-// TestChatBodyLimitExactAllowed 恰好等于上限的请求体正常放行到上游（不被 413 误伤）。
-func TestChatBodyLimitExactAllowed(t *testing.T) {
+// TestChatNoByteLevelBodyLimit 请求体**无网关侧字节上限**（server.max_body_mb 已彻底
+// 移除，对齐上游 e34cfa4/a0aae43）：数 MB 的合法 body 完整读入并照常打上游。
+// 上游限制在 token 而非字节，超限类问题交由上游自然响应（其信息量更大）。
+func TestChatNoByteLevelBodyLimit(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
-	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
-	const suffix = `"}`
-	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)) // 恰好 100 字节
-	if body := prefix + pad + suffix; len(body) != 100 {
-		t.Fatalf("fixture len=%d want 100", len(body))
-	}
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
-	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (exactly-at-limit body must proceed)", rec.Code, rec.Body)
-	}
-	if calls != 1 {
-		t.Errorf("upstream calls=%d want 1", calls)
-	}
-}
+	h := NewHandler(Config{Pool: p, Upstream: up})
 
-// TestChatOversizedBodyReturns413 请求体超过上限 → 直接 413 request_body_too_large：
-// 不打上游（calls=0）、不罚账号（无冷却/无熔断计数/无禁用）、不轮转。
-func TestChatOversizedBodyReturns413(t *testing.T) {
-	var calls int
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls++
-		return 200, sseOK, true
-	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
-	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
-	const suffix = `"}`
-	// 101 字节 > 100 上限。
-	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)+1)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d body=%s want 413", rec.Code, rec.Body)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "request_body_too_large") {
-		t.Errorf("body should carry request_body_too_large: %s", body)
-	}
-	if !strings.Contains(body, "server.max_body_mb") {
-		t.Errorf("413 message should name config key server.max_body_mb: %s", body)
-	}
-	if calls != 0 {
-		t.Errorf("upstream must not be called on 413, got %d", calls)
-	}
-	st, _ := p.Status("u1")
-	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
-		t.Errorf("413 must not penalize account: %+v", st)
-	}
-	if st.TokenUsage.RequestCount != 0 {
-		t.Errorf("413 must not record token usage: %+v", st.TokenUsage)
-	}
-}
-
-// TestChatOversizedBodyDefaultUnlimited 未注入 MaxBodyBytes 时缺省不限：
-// 8MB+1 的请求体也必须放行到上游（上游限制在 token 而非字节，见 Config 注释）。
-func TestChatOversizedBodyDefaultUnlimited(t *testing.T) {
-	var calls int
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls++
-		return 200, sseOK, true
-	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 缺省不限
-
-	body := make([]byte, 8<<20+1) // 8MB+1，旧默认下会被 413
+	// 8MB+1（旧默认上限之下会被 413）：必须放行到上游。
+	body := make([]byte, 8<<20+1)
 	copy(body, `{"model":"glm-5.2","messages":[]}`)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("code=%d want 200 (default is unlimited, no byte-level cap)", rec.Code)
+		t.Fatalf("code=%d body=%s (no byte-level cap: oversized body must reach upstream)", rec.Code, rec.Body)
 	}
 	if calls != 1 {
 		t.Errorf("upstream calls=%d want 1 (oversized body must reach upstream)", calls)
 	}
 }
 
-// TestSetMaxBodyBytesHotApply 面板在线改 server.max_body_mb 必须即时生效（issue #17：
-// 改了配置却静默不生效，用户仍被旧上限 413）。同一请求体：调小后 413、调大后放行、
-// 设为 0 变回不限，全程不重建 handler。
-func TestSetMaxBodyBytesHotApply(t *testing.T) {
+// TestChatBodyReadErrorReturns400 #41 的截断防御语义保留在读错误路径：客户端中途
+// 断流导致读 body 出错时，就地 400 invalid_request——绝不把半截 JSON 喂上游
+// unmarshal（那会让上游报 unexpected EOF，网关却冤枉罚号）。
+func TestChatBodyReadErrorReturns400(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
-
-	// 尾部空格不影响 JSON 合法性，只把请求体撑过 100 字节。
-	body := []byte(`{"model":"glm-5.2","messages":[]}` + strings.Repeat(" ", 128))
+	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d want 413 (body 228B > limit 100B)", rec.Code)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", errReader{})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s want 400 (truncated body must not reach upstream)", rec.Code, rec.Body)
 	}
-
-	h.SetMaxBodyBytes(4096) // 面板保存路径的热更新
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code=%d want 200 after enlarge (limit 4096B)", rec.Code)
+	if !strings.Contains(rec.Body.String(), "invalid_request") {
+		t.Errorf("body should carry invalid_request: %s", rec.Body)
 	}
-	if calls != 1 {
-		t.Errorf("upstream calls = %d, want 1（放行后应恰好打一次）", calls)
-	}
-
-	// 0 = 不限：8MB+ 仍放行（不再回落 8MB 兜底）。
-	h.SetMaxBodyBytes(0)
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code=%d want 200 (0 = unlimited)", rec.Code)
-	}
-	// 负值归一为不限（不 panic、不回落旧 8MB）。
-	h.SetMaxBodyBytes(-5)
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		bytes.NewReader(append(body, make([]byte, 8<<20)...))))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code=%d want 200 (negative normalized to unlimited)", rec.Code)
+	if calls != 0 {
+		t.Errorf("upstream must not be called on read error, got %d", calls)
 	}
 }
+
+// errReader 读即失败，模拟客户端中途断流/半截请求体。
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("connection reset by peer") }
 
 // TestChatBadParamsRotatesWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
 // → 该类归 ErrBadParams：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），但**仍然轮转**

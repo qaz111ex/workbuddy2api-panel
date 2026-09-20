@@ -568,76 +568,25 @@ func TestBalanceRefreshDefaults(t *testing.T) {
 	}
 }
 
-// TestMaxBodyDefault 默认 max_body_mb=0（不限）：上游限制在 token 而非字节，
-// 缺省不设字节上限，避免把上游本来接受的请求（如 475k token 纯文本 ≈ 3.6MB，
-// 加内联图片后轻易破 8MB）先掐死。
-func TestMaxBodyDefault(t *testing.T) {
-	c := Default()
-	if err := c.normalize(); err != nil {
-		t.Fatalf("normalize: %v", err)
-	}
-	if c.Server.MaxBodyMB != 0 {
-		t.Errorf("max_body_mb=%d want 0 (unlimited)", c.Server.MaxBodyMB)
-	}
-}
-
-// TestMaxBodyExplicit 显式设置 max_body_mb（正数 = 启用字节上限）。
-func TestMaxBodyExplicit(t *testing.T) {
+// TestMaxBodyKeyRemoved server.max_body_mb 与 WB2A_MAX_BODY_MB 已**彻底移除**：
+// 旧配置里的该键与旧环境变量都必须被静默忽略，不影响启动（未知键容忍），
+// 且不再有任何可观察的配置面。
+func TestMaxBodyKeyRemoved(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":16}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Server.MaxBodyMB != 16 {
-		t.Errorf("max_body_mb=%d want 16", c.Server.MaxBodyMB)
-	}
-}
-
-// TestMaxBodyZeroUnlimited 显式 0 = 不限（合法值，与缺省同义）。
-func TestMaxBodyZeroUnlimited(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":0}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatalf("0 must be accepted as unlimited: %v", err)
-	}
-	if c.Server.MaxBodyMB != 0 {
-		t.Errorf("max_body_mb=%d want 0", c.Server.MaxBodyMB)
-	}
-}
-
-// TestMaxBodyInvalid 非法值（负数）normalize 报错：负数既不表达"不限"也不表达
-// 某个上限，fail fast 而不是静默归一。
-func TestMaxBodyInvalid(t *testing.T) {
-	for _, v := range []string{"-1", "-100"} {
-		dir := t.TempDir()
-		fp := filepath.Join(dir, "c.json")
+	// 旧配置形态：显式 8（历史默认）、0（1.12.1 的"不限"）、负数（曾被拒）——
+	// 三种都必须照常启动（键已不存在，JSON 未知字段忽略）。
+	for _, v := range []string{"8", "0", "-1"} {
 		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)
-		_, err := Load(fp)
-		if err == nil {
-			t.Fatalf("want error for max_body_mb=%s", v)
-		}
-		if !strings.Contains(err.Error(), "server.max_body_mb") {
-			t.Errorf("error should name config key server.max_body_mb: %v", err)
+		if _, err := Load(fp); err != nil {
+			t.Fatalf("removed key max_body_mb=%s must be ignored, got: %v", v, err)
 		}
 	}
-}
-
-// TestMaxBodyEnvOverride env WB2A_MAX_BODY_MB 非空覆盖 JSON 值。
-func TestMaxBodyEnvOverride(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":4}}`), 0o600)
-	t.Setenv("WB2A_MAX_BODY_MB", "12")
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Server.MaxBodyMB != 12 {
-		t.Errorf("max_body_mb=%d want env 12", c.Server.MaxBodyMB)
+	// 旧环境变量同样不再读取（不得因非法值报错或改变任何行为）。
+	os.WriteFile(fp, []byte(`{}`), 0o600)
+	t.Setenv("WB2A_MAX_BODY_MB", "not-a-number")
+	if _, err := Load(fp); err != nil {
+		t.Fatalf("removed env WB2A_MAX_BODY_MB must be ignored, got: %v", err)
 	}
 }
 
