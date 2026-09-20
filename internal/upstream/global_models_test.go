@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -97,6 +98,10 @@ func TestParseGlobalModelEnvelopeVariants(t *testing.T) {
 		{"data 字符串数组（窄表）", `{"code":0,"data":["m-narrow"]}`, "m-narrow", 0, 0},
 		{"data 对象数组", `{"code":0,"data":[{"id":"m-objarr"}]}`, "m-objarr", 0, 0},
 		{"data.list 容器 + name 兜底", `{"code":0,"data":{"list":[{"name":"m-byname"}]}}`, "m-byname", 0, 0},
+		// 裸顶层数组（无任何信封）：Go 把数组反序列化进 struct 会直接报错，故必须
+		// 有「信封解析失败 → 整个 raw 当 payload」的回退（吸收 upstream c3cc888）。
+		{"裸顶层对象数组", `[{"id":"m-bare-obj","maxInputTokens":65536}]`, "m-bare-obj", 65536, 0},
+		{"裸顶层字符串数组", `["m-bare-str"]`, "m-bare-str", 0, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -156,4 +161,132 @@ func TestParseGlobalModelNamesKeepsReasoning(t *testing.T) {
 	if err != nil || len(infos2) != 1 || infos2[0].DefaultEffort != "max" || defaults2["legacy"] != "max" {
 		t.Fatalf("legacy effort: infos=%v defaults=%v err=%v", infos2, defaults2, err)
 	}
+}
+
+// snapshotTestClient 返回一个 global 探测可用的 Client：两路探测（/v3/config 与
+// /v2 企业路）都指向同一个 fake，并统计请求次数（只读快照必须零新请求）。
+// 本 fork 的 global 探测是 v3 + 企业家族并发，两路都会打同一个 host。
+func snapshotTestClient(t *testing.T, body string) (*Client, *int) {
+	t.Helper()
+	inner := rtFunc(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, body), nil
+	})
+	calls := 0
+	c := &Client{
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return inner.RoundTrip(r)
+		})},
+		ChatBaseCN:     "https://chat.example",
+		BillingBaseCN:  "https://billing.example",
+		ChatBaseGlobal: "https://global.example",
+		GlobalEnabled:  true,
+	}
+	return c, &calls
+}
+
+// TestGlobalModelInfosSnapshotReadOnly 只读快照的三个契约（issue #176 T1）：
+//   - (a) 冷客户端（从未探测）→ 快照 nil，零上游请求（绝不主动探测）；
+//   - (b) 一次 FetchGlobalModelInfos 预热（v3 + /v2 并发两请求）→ 快照返回
+//     同一批全字段 infos（含 credits 原文）；
+//   - (c) 预热后反复读快照 → fake 请求计数不变（只读，与 Fetch* 的 miss 即探测
+//     语义相反——本方法服务 /v1/stats，缓存冷就冷，不发起网络）。
+//
+// 本 fork 适配：fetchGlobalModelsOnce 有「静态名单补缺」——成功探测后 infos 会
+// 追加 GlobalModelNames 的补缺条目（只带 ID）。故快照长度不是探测条目数，断言
+// 改为「hy3 在其中且带倍率原文」，而非 sk 上游的 len==1。
+func TestGlobalModelInfosSnapshotReadOnly(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	c, calls := snapshotTestClient(t, `{"code":0,"data":{"models":[{"id":"hy3","name":"Hy3","credits":"x0.05"}]}}`)
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+
+	// (a) 冷：快照 nil，零上游请求。
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Fatalf("cold snapshot = %+v, want nil", got)
+	}
+	if *calls != 0 {
+		t.Fatalf("cold snapshot made %d upstream calls, want 0 (must not probe)", *calls)
+	}
+
+	// (b) 预热：v3/config + /v2 企业路各一次 → 快照返回同批 infos。
+	infos := c.FetchGlobalModelInfos(a)
+	hy3 := findInfo(infos, "hy3")
+	if hy3 == nil || hy3.Credits != "x0.05" {
+		t.Fatalf("warm FetchGlobalModelInfos = %+v, want hy3 with credits x0.05", infos)
+	}
+	if len(infos) < 2 {
+		t.Fatalf("infos=%d want ≥2（本 fork 会补 GlobalModelNames 缺失项）", len(infos))
+	}
+	snap := c.GlobalModelInfosSnapshot()
+	snapHy3 := findInfo(snap, "hy3")
+	if snapHy3 == nil || snapHy3.Credits != "x0.05" {
+		t.Fatalf("snapshot = %+v, want same infos as fetch", snap)
+	}
+	if len(snap) != len(infos) {
+		t.Errorf("snapshot len=%d want %d（与 Fetch 同一批）", len(snap), len(infos))
+	}
+	warmCalls := *calls
+
+	// (c) 只读：再读 N 次零新请求。
+	for i := 0; i < 5; i++ {
+		got := c.GlobalModelInfosSnapshot()
+		if findInfo(got, "hy3") == nil {
+			t.Fatalf("snapshot read #%d = %+v, want cached infos", i, got)
+		}
+	}
+	if *calls != warmCalls {
+		t.Errorf("snapshot reads made %d new upstream calls, want 0 (read-only)", *calls-warmCalls)
+	}
+}
+
+// TestGlobalModelInfosSnapshotExpired 过期快照 → nil（只读口不探测，也不返回陈旧值）。
+func TestGlobalModelInfosSnapshotExpired(t *testing.T) {
+	c, calls := snapshotTestClient(t, `{"code":0,"data":{"models":[{"id":"hy3","credits":"x0.05"}]}}`)
+	c.globalModels.Lock()
+	c.globalModels.infos = []ModelInfo{{ID: "hy3", Credits: "x0.05"}}
+	c.globalModels.fetched = time.Now().Add(-2 * globalModelsTTL)
+	c.globalModels.Unlock()
+
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Fatalf("expired snapshot = %+v, want nil", got)
+	}
+	if *calls != 0 {
+		t.Errorf("expired snapshot made %d upstream calls, want 0", *calls)
+	}
+}
+
+// TestGlobalModelInfosSnapshotNarrowTableNil 窄表形态（infos 为 nil，names 有值）
+// → 快照 nil（无对象字段不编造）。
+func TestGlobalModelInfosSnapshotNarrowTableNil(t *testing.T) {
+	c, _ := snapshotTestClient(t, `{"code":0,"data":["hy3"]}`)
+	c.globalModels.Lock()
+	c.globalModels.names = []string{"hy3"}
+	c.globalModels.infos = nil
+	c.globalModels.fetched = time.Now()
+	c.globalModels.Unlock()
+
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Fatalf("narrow-table snapshot = %+v, want nil", got)
+	}
+}
+
+// TestGlobalModelInfosSnapshotNilClient nil Client 不得 panic（防御：调用方可能
+// 在 cfg.Upstream 为 nil 时误调）。
+func TestGlobalModelInfosSnapshotNilClient(t *testing.T) {
+	var c *Client
+	if got := c.GlobalModelInfosSnapshot(); got != nil {
+		t.Fatalf("nil client snapshot = %+v, want nil", got)
+	}
+}
+
+// findInfo 按 id 取条目；不存在返回 nil。
+func findInfo(infos []ModelInfo, id string) *ModelInfo {
+	for i := range infos {
+		if infos[i].ID == id {
+			return &infos[i]
+		}
+	}
+	return nil
 }

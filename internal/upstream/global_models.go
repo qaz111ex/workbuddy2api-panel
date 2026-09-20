@@ -99,6 +99,26 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 	return infos
 }
 
+// GlobalModelInfosSnapshot 只读 global 模型目录全字段缓存（TTL 内快照）；
+// 冷 / 过期 / 窄表形态 / 未探测 → nil。不发起任何上游探测——与
+// FetchGlobalModelInfos 的差异点（那个在 miss 时触发探测，服务 /v1/models；
+// 本方法服务 /v1/stats 的倍率透出，只读已有数据）。
+//
+// 注意本 fork 的 fetchGlobalModelsOnce 有「静态名单补缺」：成功探测后 infos 里
+// 会追加 GlobalModelNames 的补缺条目（只带 ID、Credits 为空）——本方法原样返回
+// 同一批 infos，调用方按 id 查 credits，补缺条目的倍率为空（缺失≠免费）。
+func (c *Client) GlobalModelInfosSnapshot() []ModelInfo {
+	if c == nil {
+		return nil
+	}
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	if len(c.globalModels.infos) == 0 || time.Since(c.globalModels.fetched) >= globalModelsTTL {
+		return nil
+	}
+	return c.globalModels.infos
+}
+
 // fetchGlobalModelsOnce 单次探测决策（缓存命中/负缓存/触发探测），返回 (names, infos)。
 // 纯动态：成功 = 并集结果去重；一切失败 = nil（不回落静态）。
 // infos 仅对象形态成功探测时非 nil。
@@ -437,26 +457,12 @@ func (m globalModelAltEntry) modelInfo() ModelInfo {
 // result；条目可以是字符串（裸 ID）或对象（id 依次回退 id → modelId → model → name，
 // 窗口键兼容 contextWindow / maxTokens）；disabled 条目剔除。
 // 首个解析出非空名单的候选即选中——只认单一形态会把登录成功的账号误判成"无模型"。
+//
+// 裸顶层数组（`[ {...}, ... ]` 无任何信封）也支持：Go 把数组反序列化进 struct 会直接
+// 报错（cannot unmarshal array into Go value of type struct），故信封解析失败时回退把
+// **整个 raw** 当作一个候选 payload 解析（吸收 upstream c3cc888 的该项修复）。
 func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
-	var env struct {
-		Code   int             `json:"code"`
-		Data   json.RawMessage `json:"data"`
-		Models json.RawMessage `json:"models"`
-		Items  json.RawMessage `json:"items"`
-		List   json.RawMessage `json:"list"`
-		Result json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("global models parse: %w", err)
-	}
-	if env.Code != 0 {
-		return nil, nil, nil, nil, fmt.Errorf("global models code=%d", env.Code)
-	}
-	for _, payload := range []json.RawMessage{env.Data, env.Models, env.Items, env.List, env.Result} {
-		entries, ok := parseGlobalModelPayload(payload)
-		if !ok || len(entries) == 0 {
-			continue
-		}
+	emit := func(entries []ModelInfo) ([]string, []ModelInfo, map[string][]string, map[string]string, error) {
 		names = make([]string, 0, len(entries))
 		infos = make([]ModelInfo, 0, len(entries))
 		for _, mi := range entries {
@@ -476,6 +482,32 @@ func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, effor
 			}
 		}
 		return names, infos, efforts, defaults, nil
+	}
+
+	var env struct {
+		Code   int             `json:"code"`
+		Data   json.RawMessage `json:"data"`
+		Models json.RawMessage `json:"models"`
+		Items  json.RawMessage `json:"items"`
+		List   json.RawMessage `json:"list"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		// 裸顶层数组：信封解析失败 → 整个 body 当作 payload 再试一次。
+		if entries, ok := parseGlobalModelPayload(raw); ok && len(entries) > 0 {
+			return emit(entries)
+		}
+		return nil, nil, nil, nil, fmt.Errorf("global models parse: %w", err)
+	}
+	if env.Code != 0 {
+		return nil, nil, nil, nil, fmt.Errorf("global models code=%d", env.Code)
+	}
+	for _, payload := range []json.RawMessage{env.Data, env.Models, env.Items, env.List, env.Result} {
+		entries, ok := parseGlobalModelPayload(payload)
+		if !ok || len(entries) == 0 {
+			continue
+		}
+		return emit(entries)
 	}
 	return nil, nil, nil, nil, fmt.Errorf("global models empty list")
 }

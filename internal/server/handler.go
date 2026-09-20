@@ -135,6 +135,8 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
+	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -1003,12 +1005,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if hasUsage {
 				st.toks = toks
 			}
+			// metrics 采集：token 三段 + 缓存三段 + 真实扣费（供 /v1/stats）。
+			// 与成本账本同源同口径（都读末帧 usage），故此处一并带出，避免二次解析。
+			// hasUsage 用 UsageSeen()（任一 token 字段出现即算观测）而非
+			// hasCompletionTokens：末帧只带 prompt_tokens 时，已观测到的 prompt
+			// tokens 与缓存三段不该被整段漏计。
+			st.hasUsage = stats.UsageSeen()
+			st.prompt = stats.PromptTokens()
+			st.cacheHit, st.cacheMiss, st.cacheWr = stats.CacheTokens()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
 				if total, tok := stats.TotalTokens(); tok && total > 0 {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 				}
+				// metrics 真实扣费（与账本同源）：credit 缺失时保持 hasCredit=false，
+				// 与账本同一「缺失≠0」纪律。
+				st.credit = credit
+				st.hasCredit = true
 			} else if hasUsage {
 				// 观测防护：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
@@ -1034,6 +1048,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 		}
+		// metrics 采集（非流式）：与流式同口径，从同一份 usage 带出。
+		fillStatFromUsage(st, resp)
 		return
 	}
 	// 末端错误透传（error-passthrough）：上游返回的错误原样透传，不再规范化成固定文案。

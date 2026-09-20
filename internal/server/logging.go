@@ -41,6 +41,19 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
+	// metrics 采集字段（供 /v1/stats 聚合）：全部来自上游 usage，缺失时保持零值
+	// 并由 hasUsage 区分「缺观测」与「显式 0」——与成本账本同一纪律。
+	// 注意 hasUsage 由 chatStatsReader.UsageSeen() 填充（任一 token 字段出现即算
+	// 有观测），不是仅按 completion_tokens 判定——否则末帧只带 prompt_tokens 时
+	// 已观测到的 prompt tokens 会被整段漏计。
+	hasUsage  bool
+	prompt    int
+	cacheHit  int
+	cacheMiss int
+	cacheWr   int
+	credit    float64
+	hasCredit bool
+
 	logged bool
 }
 
@@ -53,13 +66,18 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
 }
 
-// done 幂等落一行表格日志。
+// done 幂等落一行表格日志，并把本次请求记入 metrics 聚合（/v1/stats 数据源）。
+//
+// 单一埋点：流式 / 非流式 / 各类错误路径最终都汇到此处，故 metrics 天然覆盖全路径，
+// 不需要在每个 return 前重复记账（重复记账反而会漏分支或双计）。
 func (s *chatStat) done() {
 	if s.logged {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	total := time.Since(s.start)
+	logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	recordChatMetric(s, total)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -79,6 +97,11 @@ type chatStatsReader struct {
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	hasCredit bool
 	credit    float64
+	// cacheHit/cacheMiss/cacheWr 上游末帧 usage 的缓存三段（prompt_cache_hit_tokens /
+	// prompt_cache_miss_tokens / prompt_cache_write_tokens），供 /v1/stats 命中率聚合。
+	cacheHit  int
+	cacheMiss int
+	cacheWr   int
 	pend      []byte // 已读未返回的行缓存
 }
 
@@ -111,6 +134,24 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	}
 }
 
+// UsageSeen 报告本次流式响应是否观测到过 usage（任一 token 字段出现即算有观测）。
+//
+// 与 Tokens() 的 hasCompletionTokens 分工不同：那个是「完成 token 是否有精确值」，
+// 本方法是「本次是否有 usage 观测」——/v1/stats 的 token/缓存累加以本方法为闸门，
+// 否则末帧只带 prompt_tokens（无 completion_tokens）时，已观测到的 prompt tokens
+// 与缓存三段会被整段漏计（缺失≠0，但「部分观测」也不该被丢弃）。
+func (s *chatStatsReader) UsageSeen() bool {
+	return s.hasPromptTokens || s.hasCompletionTokens || s.hasTotalTokens
+}
+
+// PromptTokens 返回末帧 usage.prompt_tokens（供 /v1/stats 输入侧统计）。
+func (s *chatStatsReader) PromptTokens() int { return s.promptTokens }
+
+// CacheTokens 返回缓存三段计数（命中 / 未命中 / 写入），供 /v1/stats 的命中率聚合。
+func (s *chatStatsReader) CacheTokens() (hit, miss, write int) {
+	return s.cacheHit, s.cacheMiss, s.cacheWr
+}
+
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
@@ -131,6 +172,11 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CompletionTokens *int     `json:"completion_tokens"`
 			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"`
+			// 缓存三段（上游实测字段名，见 /v1/stats 的 cache_* 口径）。
+			// 缺失即 0：缓存计数没有「未观测」与「显式 0」的语义差异。
+			PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
+			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -152,6 +198,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
 	}
+	s.cacheHit = chunk.Usage.PromptCacheHitTokens
+	s.cacheMiss = chunk.Usage.PromptCacheMissTokens
+	s.cacheWr = chunk.Usage.PromptCacheWriteTokens
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
