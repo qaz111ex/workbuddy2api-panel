@@ -138,7 +138,17 @@ WB2A_LOGIN_NICKNAME="$NICKNAME" \
 WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
 WB2A_LOGIN_ACTION="$ACTION" \
 python3 - <<'PYEOF'
-import json, os
+# 原子写：先写同目录临时文件，fsync 后 os.replace 覆盖。
+#
+# 为什么必须原子（与 auths 目录热加载配套）：网关每 5s 轮询 auths/ 目录指纹并全量
+# 重扫。若此处用 `open(target,"w")` 直写，写入中途目录里会短暂存在**半截 JSON**，
+# 而 auth.LoadDir 对坏文件是「跳过」——那一次 reload 会把该 uid 从池中剔除
+# （已由 internal/pool/watch_partial_test.go 固化该行为）。虽然下一次指纹变化会把它
+# 加载回来（瞬时抖动而非永久丢失），但停用/冷却状态在剔除重建间不保证连续。
+# tempfile 与目标同目录 + os.replace 是 POSIX 原子操作，读方永远看到完整旧文件或
+# 完整新文件（Windows 上 os.replace 同样覆盖已存在文件）。
+# 另：临时文件前缀用 "." 开头，避开 LoadDir 的 workbuddy*.json glob。
+import json, os, tempfile
 
 auth = {
     "account": {
@@ -153,9 +163,34 @@ auth = {
         "domain": os.environ["WB2A_LOGIN_DOMAIN"],
     },
 }
-with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
-    json.dump(auth, f, indent=1)
-print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
+
+auth_file = os.environ["WB2A_LOGIN_AUTH_FILE"]
+tmp_file = None
+try:
+    fd, tmp_file = tempfile.mkstemp(prefix=".workbuddy-auth-", dir=os.path.dirname(auth_file) or ".")
+    with os.fdopen(fd, "w") as f:
+        json.dump(auth, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_file, auth_file)
+    tmp_file = None
+except Exception as e:
+    # 写入失败给出可操作指引（目录不可写是部署时最常见的失败形态）。
+    print(f"❌ 写入 {auth_file} 失败: {e}", file=__import__("sys").stderr)
+    auth_dir = os.path.dirname(auth_file) or "."
+    if not os.access(auth_dir, os.W_OK):
+        print(f"    {auth_dir}/ 不可写。容器部署请执行：", file=__import__("sys").stderr)
+        print(f"    chown -R 10001:10001 {auth_dir}", file=__import__("sys").stderr)
+        print("    或在容器内登录（属主自动正确）：", file=__import__("sys").stderr)
+        print("    docker compose exec -it wb2api bash -c './login.sh'", file=__import__("sys").stderr)
+    raise
+finally:
+    if tmp_file is not None:
+        try:
+            os.unlink(tmp_file)
+        except FileNotFoundError:
+            pass
+print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {auth_file}")
 PYEOF
 
 # ─── 重启服务 ────────────────────────────────────────────
