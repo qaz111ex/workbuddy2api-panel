@@ -40,13 +40,20 @@ func withCNCatalog(t *testing.T, ids ...string) {
 	})
 }
 
-// newRealmFakeUpstream 按 chat 路径分流返回的假上游：global 走 /console/chat/completions，
-// cn 走 /v2/chat/completions。fn 返回该路径下的响应（status/body/isStream）。
-func newRealmFakeUpstream(t *testing.T, fn func(path string) (int, string, bool)) *upstream.Client {
+// newRealmFakeUpstream 按 **realm（上游 host）** 分流返回的假上游：global 走
+// global.example、cn 走 cn.example。fn 返回该域下的响应（status/body/isStream）。
+//
+// 为什么不按 path 分流：#119 后 global 出站固定 /v2/chat/completions（与 cn 同路径，
+// /console 挂腾讯云 WAF 内容规则），两域路径不再可区分；域的唯一判据是 base host。
+func newRealmFakeUpstream(t *testing.T, fn func(realm, path string) (int, string, bool)) *upstream.Client {
 	t.Helper()
 	return &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			status, body, isStream := fn(r.URL.Path)
+			realm := "cn"
+			if r.URL.Host == "global.example" {
+				realm = "global"
+			}
+			status, body, isStream := fn(realm, r.URL.Path)
 			ct := "application/json"
 			if isStream {
 				ct = "text/event-stream"
@@ -144,8 +151,8 @@ func TestChooseRealmSkipsExhaustedAndBlocked(t *testing.T) {
 // TestChatPinnedGlobalFallsBackToCN 端到端：显式 global: 前缀的国际版账号被限流后，
 // 同请求自动改用国内版账号继续服务（客户端无需改模型名）。
 func TestChatPinnedGlobalFallsBackToCN(t *testing.T) {
-	up := newRealmFakeUpstream(t, func(path string) (int, string, bool) {
-		if path == "/console/chat/completions" {
+	up := newRealmFakeUpstream(t, func(realm, path string) (int, string, bool) {
+		if realm == "global" {
 			return 429, `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, false
 		}
 		return 200, sseOK, true
@@ -166,8 +173,8 @@ func TestChatPinnedGlobalFallsBackToCN(t *testing.T) {
 // TestChatPinnedCNFallsBackToGlobal 端到端：显式 cn: 前缀的国内版账号失败后，
 // 同请求自动改用国际版账号继续服务。
 func TestChatPinnedCNFallsBackToGlobal(t *testing.T) {
-	up := newRealmFakeUpstream(t, func(path string) (int, string, bool) {
-		if path == "/v2/chat/completions" {
+	up := newRealmFakeUpstream(t, func(realm, path string) (int, string, bool) {
+		if realm == "cn" {
 			return 402, `{"code":1,"msg":"余额不足"}`, false
 		}
 		return 200, sseOK, true
@@ -188,10 +195,10 @@ func TestChatPinnedCNFallsBackToGlobal(t *testing.T) {
 // TestChatRealmFallbackDisabledPinsRealm 回落关闭：显式前缀硬钉，首选域不可用时
 // 不再借用另一域（保持严格域路由语义）。
 func TestChatRealmFallbackDisabledPinsRealm(t *testing.T) {
-	var usedGlobalPath bool
-	up := newRealmFakeUpstream(t, func(path string) (int, string, bool) {
-		if path == "/console/chat/completions" {
-			usedGlobalPath = true
+	var usedGlobalRealm bool
+	up := newRealmFakeUpstream(t, func(realm, path string) (int, string, bool) {
+		if realm == "global" {
+			usedGlobalRealm = true
 			return 429, `{"code":11140,"msg":"rate limit"}`, false
 		}
 		return 200, sseOK, true
@@ -204,8 +211,8 @@ func TestChatRealmFallbackDisabledPinsRealm(t *testing.T) {
 	if rec.Code != 429 {
 		t.Fatalf("code=%d body=%s want 429 (fallback disabled)", rec.Code, rec.Body)
 	}
-	if !usedGlobalPath {
-		t.Fatal("expected the global upstream path to be used at least once")
+	if !usedGlobalRealm {
+		t.Fatal("expected the global upstream realm to be used at least once")
 	}
 	if st, _ := p.Status("c1"); st.Cooling || st.Disabled {
 		t.Fatalf("cn account must not be touched when fallback is disabled: %+v", st)
@@ -215,9 +222,9 @@ func TestChatRealmFallbackDisabledPinsRealm(t *testing.T) {
 // TestChatBareModelGlobalOnlyPoolRoutesGlobal 纯国际版池 + 裸模型名照常走 global
 // （跨域顺序 [cn, global]，cn 无可用账号 → 直接 global）。
 func TestChatBareModelGlobalOnlyPoolRoutesGlobal(t *testing.T) {
-	var gotPath string
-	up := newRealmFakeUpstream(t, func(path string) (int, string, bool) {
-		gotPath = path
+	var gotRealm string
+	up := newRealmFakeUpstream(t, func(realm, path string) (int, string, bool) {
+		gotRealm = realm
 		return 200, sseOK, true
 	})
 	p := testPoolWith(globalAuth("g1"))
@@ -228,8 +235,8 @@ func TestChatBareModelGlobalOnlyPoolRoutesGlobal(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s (bare model on global-only pool must not 503)", rec.Code, rec.Body)
 	}
-	if gotPath != "/console/chat/completions" {
-		t.Fatalf("upstream path=%q want /console/chat/completions (global route)", gotPath)
+	if gotRealm != "global" {
+		t.Fatalf("upstream realm=%q want global (global route)", gotRealm)
 	}
 }
 
@@ -246,9 +253,9 @@ func TestChooseRealmOrderPreference(t *testing.T) {
 // CN 目录缓存预热为「含该模型」——这是禁用前的真实状态，验证回落不依赖目录是否过期。
 func TestChatAllCNDisabledUsesGlobal(t *testing.T) {
 	withCNCatalog(t, "deepseek-v4.1-flash")
-	var gotPath string
-	up := newRealmFakeUpstream(t, func(path string) (int, string, bool) {
-		gotPath = path
+	var gotRealm string
+	up := newRealmFakeUpstream(t, func(realm, path string) (int, string, bool) {
+		gotRealm = realm
 		return 200, sseOK, true
 	})
 	p := testPoolWith(globalAuth("g1"), cnAuth("c1"))
@@ -260,8 +267,8 @@ func TestChatAllCNDisabledUsesGlobal(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s (all cn disabled must use global)", rec.Code, rec.Body)
 	}
-	if gotPath != "/console/chat/completions" {
-		t.Fatalf("upstream path=%q want /console/chat/completions (global route)", gotPath)
+	if gotRealm != "global" {
+		t.Fatalf("upstream realm=%q want global (global route)", gotRealm)
 	}
 }
 
@@ -269,8 +276,8 @@ func TestChatAllCNDisabledUsesGlobal(t *testing.T) {
 // 仍要轮到国际版（首选域尝试配额 + 跨域回落）。5 个 cn 账号全部 5xx，global 一次成功。
 func TestChatAllCNFailingReachesGlobal(t *testing.T) {
 	var cnHits, globalHits int
-	up := newRealmFakeUpstream(t, func(path string) (int, string, bool) {
-		if path == "/console/chat/completions" {
+	up := newRealmFakeUpstream(t, func(realm, path string) (int, string, bool) {
+		if realm == "global" {
 			globalHits++
 			return 200, sseOK, true
 		}

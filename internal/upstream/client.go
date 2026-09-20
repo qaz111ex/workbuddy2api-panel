@@ -195,15 +195,18 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
-// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
-const softRateResetPattern = `将在 (.+?) 重置`
+// softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
+// "reset at <固定格式时间>"），捕获中间的时间串。
+const softRateResetPatternCN = `将在 (.+?) 重置`
+const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})`
 
 // 限流判定正则预编译为包级 var：IsModelRateLimit / ParseRateReset 在每次错误
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
+	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
@@ -372,7 +375,14 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
-	m := reSoftRateReset.FindStringSubmatch(body)
+	// CN 文案优先；global 域 429 body 是英文形态（"will reset at YYYY-MM-DD HH:MM:SS
+	// UTC+8"），此前只认中文 → global 限流解析不到恢复时刻，退回有界退避基数反复
+	// 翻倍（修「global 域冷却指数翻倍」）。英文正则锚定固定格式时间，自然语言
+	// （"reset at the end of the day"）不匹配。
+	m := reSoftRateResetCN.FindStringSubmatch(body)
+	if len(m) < 2 {
+		m = reSoftRateResetEN.FindStringSubmatch(body)
+	}
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
@@ -640,21 +650,35 @@ func (c *Client) globalOn(a *auth.Auth) bool {
 	return c.GlobalEnabled && a != nil && a.Realm() == "global"
 }
 
-// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
+// 路径常量：CN 现状路径（chatCompletionsPath）与 global 的旧 /console 路径。
 const (
 	chatCompletionsPath   = "/v2/chat/completions"
 	globalChatConsolePath = "/console/chat/completions"
 )
 
 // chatPaths 按 realm 返回 chat 端点路径候选序列：
-// global → [console, v2]（404/405 时 fallback）；cn → [v2]（现状逐字，零回归）。
+//
+// global → [/v2, /console]（**/v2 为主路**，#119）；cn → [/v2]（现状逐字，零回归）。
+//
+// 为什么 global 改以 /v2 为主：上游 #119 实测 /console 挂腾讯云 WAF body 内容规则，
+// 反引号 printf/whoami 等命令执行特征确定性 403——agent 会话里出现这类文本（读日志、
+// 写脚本）就被拦，表现为 global 号随机 403。同 base 的 /v2 不挂该规则且实测等价端点。
+// 本 fork 的 global 模型目录探测本就以 /v2 为主路（globalModelsProbePaths），
+// 即 /v2 对 global 账号是已知可用的 base。
+//
+// 与上游 4ac68b7 的差异（有意保留）：上游把 fallback 链整体退役（global 恒单路径
+// /v2），本 fork 保留 404/405 回落 /console。理由：正常路径下请求不再触达 /console
+// （WAF 问题已消除），而一旦上游未来下线 /v2，404/405 回落能让 global chat 继续可用，
+// 避免"整体不可用"。这条回落路径零常态成本，只在端点消失时生效。
 func (c *Client) chatPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
+		return []string{chatCompletionsPath, globalChatConsolePath}
 	}
 	return []string{chatCompletionsPath}
 }
 
+// chatFallbackHTTPStatus fallback 只在 404/405 时发生（上游路径分叉/下线）。
+// 不含 403：403 是 WAF 内容规则判定，换路径重试只会重复触发罚号链路。
 func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
 
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
@@ -903,8 +927,8 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 需要客户端断开联动的调用方用 ChatStreamContext 传入请求 ctx。
 //
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
-// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
+// global realm：主路 /v2/chat/completions，404/405 时同一 base 二次换
+// /console/chat/completions（见 chatPaths 的 #119 说明）。cn：/v2 现状不变。
 func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
 }
@@ -921,13 +945,14 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 原文）。判定为 ErrNone 的响应（理论上不存在，防御）err 为 nil，handler 按
 // respBody 自行兜底。
 //
-// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody
-// 后统一套用全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
+// global 主路 /v2，仅 404/405 时换 /console 重试（见 chatPaths）；ensureConsoleSystem
+// 在 prepareBody 后统一套用全局脚本：首条消息非 system 时前置兜底 system
+// （防 console 域上游 code 11-128）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// global 首次路径 404/405 时换 fallback 路径重试。
+	// global 主路 /v2；404/405 时换 fallback 路径重试。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
