@@ -245,6 +245,17 @@ go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
+**后台启停脚本**（可选，仓库自带三件套）：
+
+```powershell
+.\start-workbuddy2api.cmd    # 后台启动，PID 写入 wb2api.pid
+.\status-workbuddy2api.cmd   # 查进程 + 打 /healthz
+.\stop-workbuddy2api.cmd     # 停止
+```
+
+日志分别写入 `data/server.out.log` / `data/server.err.log`。停止脚本会先校验 PID 对应的
+可执行文件确为**当前目录**下的 `wb2api.exe`，因此陈旧 PID 文件不会误杀其他进程。
+
 ### 方式三：源码运行（开发调试）
 
 ```bash
@@ -276,9 +287,20 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 # 按提示在浏览器打开授权链接 → 回到终端确认 → 凭证落盘 auths/workbuddy-<uid>.json
 ```
 
-`login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
+`login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。
 
 > Windows 用户请用方式 A（或 WSL）；`login.sh` 需要 python3。
+
+**方式 C：直接放入凭证文件（免重启）**
+
+把 `workbuddy-<uid>.json` 放进 `auths/` 目录即可。网关**每 5 秒轮询一次该目录**
+（按 文件名 + mtime + 大小 生成指纹），内容变化时自动重新对齐账号池——新增账号
+自动进池、删除文件自动剔除，**无需重启进程**（对 Windows 单文件 exe 部署尤其重要：
+面板的「一键重启」走 docker restart，在该形态下不可用）。已存在账号只换凭证、
+保留积分/冷却/成本账本，重复触发不重置任何运行状态。
+
+> 凭证文件必须匹配 `workbuddy*.json` 命名（与 `auth.LoadDir` 的 glob 一致）。
+> 目录不可读时只记一条日志并跳过热加载，加账号仍可用「手动重启」这条既有退路。
 
 ### 验证
 
@@ -549,6 +571,8 @@ http://127.0.0.1:7863/panel/
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体无网关侧大小上限 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
+| `GET /v1/stats` | Bearer（`api_key` 非空时） | 按模型聚合的请求统计（进程内累加，重启清零）：请求/成功/失败/流式数、平均首字延迟与端到端耗时、生成吞吐、token 三段、缓存命中/未命中/写入与命中率、真实扣费 credit；单模型行附上游积分倍率 `credits`（与 `/v1/models` 同源，目录缓存冷时该字段整体省略——**缺失≠免费**） |
+| `POST /v1/stats/reset` | Bearer（`api_key` 非空时） | 清空统计累计并重置 `since`，便于观察增量 |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
