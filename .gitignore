@@ -39,6 +39,10 @@ docs/
 /wb2api.exe
 /login.exe
 /credit.exe
+/signin_bin.exe
+
+# Windows 服务脚本（start-workbuddy2api.cmd）的运行期产物
+wb2api.pid
 
 # 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
 /cmd/desktopverify*/

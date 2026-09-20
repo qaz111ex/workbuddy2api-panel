@@ -91,6 +91,14 @@ func main() {
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
+	// auths 目录热加载：新增凭证文件自动进池，免去「加完账号手动重启网关」。
+	// 启动时的 SyncToDir 已建立基线，监听只在后续目录内容变化时触发（见 pool/watch.go）。
+	// 这是**面板之外**新增账号的唯一自动通道：面板登录路径自己会 Pool.Add（见
+	// internal/panel/login.go），而 login.sh / 手工放文件不会——在 Windows 单文件 exe
+	// 部署上（无 docker restart 可用）此前只能人工重启进程。
+	stopWatch := p.StartAuthDirWatch(cfg.AuthDir)
+	defer stopWatch()
+
 	// 熔断器 + 在途上限（含 global 分档）+ 连败降权 + 三因子加权调优（从 config 注入，
 	// 非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
