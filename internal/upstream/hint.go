@@ -45,6 +45,8 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	switch kind {
 	case ErrPromptTooLong:
 		return "request context exceeds the model's limit; reduce history/message size"
+	case ErrImageInvalid:
+		return "image request was rejected by upstream; check image_url format and image data"
 	case ErrWafBlock:
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。
@@ -127,12 +129,32 @@ func isModelParamInvalid(body string) bool {
 }
 
 // isInvalidImageData 上游 11135 body 判定（code 11135 / invalid_image_data /
-// "replace the image" msg 家族）。
+// "replace the image" msg 家族）。只服务 **hint** 层的 11135 专属文案。
+//
+// 注意口径差异：分类侧的图片无效判定比本函数宽（额外含 `invalid image_url content`），
+// 见 isImageInvalidBody。两者刻意不同——本函数对应的文案是「image data 无效，换张真图」，
+// 而 `invalid image_url content` 指的是 **URL 格式**问题，走 Kind 表里 ErrImageInvalid
+// 的「check image_url format and image data」更贴切。上游（sk）同样是两个独立口径。
 func isInvalidImageData(body string) bool {
 	lower := strings.ToLower(body)
 	return codeMarker(lower, "11135") ||
 		strings.Contains(lower, "invalid_image_data") ||
 		strings.Contains(lower, "replace the image")
+}
+
+// isImageInvalidBody 图片请求无效的**分类**口径（Classify → ErrImageInvalid）。
+//
+// 比 isInvalidImageData（hint 口径）多覆盖 `Parse message failed: invalid image_url
+// content`：该族常与 code 11101 同行出现，是上游最常见的图片报错文案（sk c5cdb46 的
+// invalidImageRule 把它列在首位）。它同样是**确定性的请求级错误**——同一个 body 换任何
+// 账号结果都不变，因此必须 fail-fast，而不是落 ErrBadParams 白轮转一圈健康账号。
+//
+// 不合并进 isInvalidImageData 的理由见该函数注释（hint 文案指向不同）。
+func isImageInvalidBody(body string) bool {
+	if isInvalidImageData(body) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(body), "invalid image_url content")
 }
 
 // codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，

@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 )
 
@@ -187,6 +188,146 @@ func decodeBody(b []byte) (map[string]any, error) {
 	var obj map[string]any
 	err := json.Unmarshal(b, &obj)
 	return obj, err
+}
+
+// TestNormalizeImageURL 覆盖 OpenAI chat 多模态内容的 image_url 兼容：
+// 字符串形态必须转为上游需要的对象形态；对象形态及其中字段必须原样保留；
+// 无效输入不补默认值，继续交给上游返回真实错误。
+//
+// 断言走 PrepareBodyOptWithEfforts 全链路（而非直接调 normalizeImageURL），
+// 保证管线挂载点不会在后续重构里被摘掉。
+func TestNormalizeImageURL(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want any
+	}{
+		{
+			name: "data url string to object",
+			body: `{"messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":"data:image/png;base64,QUJD"}]}]}`,
+			want: map[string]any{"url": "data:image/png;base64,QUJD"},
+		},
+		{
+			name: "http url string to object",
+			body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":"https://example.test/a.png"}]}]}`,
+			want: map[string]any{"url": "https://example.test/a.png"},
+		},
+		{
+			name: "object with detail preserved",
+			body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD","detail":"low","mime_type":"image/png"}}]}]}`,
+			want: map[string]any{"url": "data:image/png;base64,QUJD", "detail": "low", "mime_type": "image/png"},
+		},
+		{
+			name: "invalid object url type preserved",
+			body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":123}}]}]}`,
+			want: map[string]any{"url": float64(123)},
+		},
+		{
+			name: "missing image url preserved",
+			body: `{"messages":[{"role":"user","content":[{"type":"image_url"}]}]}`,
+			want: nil,
+		},
+		{
+			name: "empty string preserved",
+			body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":""}]}]}`,
+			want: "",
+		},
+		{
+			name: "non image part untouched",
+			body: `{"messages":[{"role":"user","content":[{"type":"text","text":"hi","image_url":"not-a-part"}]}]}`,
+			want: nil, // 非 image_url part：本用例改查 text part，见下方断言
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, sanitize := range []bool{false, true} {
+				out := PrepareBodyOptWithEfforts([]byte(tc.body), sanitize, nil)
+				obj, err := decodeBody(out)
+				if err != nil {
+					t.Fatalf("sanitize=%v unmarshal: %v (out=%s)", sanitize, err, out)
+				}
+				msgs := obj["messages"].([]any)
+				content := msgs[0].(map[string]any)["content"].([]any)
+				if tc.name == "non image part untouched" {
+					part := content[0].(map[string]any)
+					if got := part["image_url"]; got != "not-a-part" {
+						t.Errorf("sanitize=%v: text part image_url=%#v want %q", sanitize, got, "not-a-part")
+					}
+					continue
+				}
+				var part map[string]any
+				for _, rawPart := range content {
+					candidate, ok := rawPart.(map[string]any)
+					if ok && candidate["type"] == "image_url" {
+						part = candidate
+						break
+					}
+				}
+				if part == nil {
+					t.Fatal("image_url part not found")
+				}
+				if tc.want == nil {
+					if _, exists := part["image_url"]; exists {
+						t.Fatalf("sanitize=%v: missing image_url should stay missing, got %#v", sanitize, part)
+					}
+					continue
+				}
+				if got := part["image_url"]; !reflect.DeepEqual(got, tc.want) {
+					t.Errorf("sanitize=%v: image_url=%#v want %#v", sanitize, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestNormalizeImageURLCoversAllMessages 多消息/多图片 part：归一化覆盖 messages
+// 全量（不止首条），且已是对象形态的 part 在二次通过管线时保持幂等（出站字节稳定，
+// prompt_cache_key 前缀命中的前提）。
+func TestNormalizeImageURLCoversAllMessages(t *testing.T) {
+	body := `{"messages":[` +
+		`{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,QQ=="}]},` +
+		`{"role":"assistant","content":"ok"},` +
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/b.png","detail":"high"}},{"type":"image_url","image_url":"https://example.test/c.png"}]}` +
+		`]}`
+	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+	obj, err := decodeBody(out)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	wantURLs := []string{
+		"data:image/png;base64,QQ==",
+		"https://example.test/b.png",
+		"https://example.test/c.png",
+	}
+	var got []string
+	for _, rawMsg := range msgs {
+		msg := rawMsg.(map[string]any)
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok || part["type"] != "image_url" {
+				continue
+			}
+			iu, ok := part["image_url"].(map[string]any)
+			if !ok {
+				t.Fatalf("image_url not object form: %#v", part["image_url"])
+			}
+			u, _ := iu["url"].(string)
+			got = append(got, u)
+		}
+	}
+	if !reflect.DeepEqual(got, wantURLs) {
+		t.Fatalf("normalized urls=%v want %v", got, wantURLs)
+	}
+	// 幂等：归一化后的 body 再过一次管线必须字节一致。
+	if again := PrepareBodyOptWithEfforts(out, false, nil); string(again) != string(out) {
+		t.Fatalf("normalize not idempotent:\n1st=%s\n2nd=%s", out, again)
+	}
 }
 
 // TestPrepareBodyDeterministic 序列化稳定性：同输入跑多遍出站字节级一致

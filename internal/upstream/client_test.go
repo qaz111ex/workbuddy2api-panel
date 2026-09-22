@@ -49,6 +49,32 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 图片格式/数据错误（400 + 11135 图片错误族）是确定性请求级错误：分类后
+		// 不轮转、不罚号，handler 直接透传上游原文。code 判定走 codeMarker，
+		// 天然容忍 JSON 空白（`"code": 11135` / `"code": "11135"`）。
+		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},
+		// 图片族判在 ErrBadParams 之前：同为 11101 信封，图片形态优先归 image_invalid。
+		{400, `{"code":11101,"msg":"invalid_image_data"}`, ErrImageInvalid},
+		{400, `invalid_image_data`, ErrImageInvalid},
+		{400, `{"code":11101,"msg":"please replace the image and retry"}`, ErrImageInvalid},
+		{400, `{"code": 11135, "msg": "image rejected"}`, ErrImageInvalid},
+		{400, `{"code": "11135", "msg": "image rejected"}`, ErrImageInvalid},
+		{400, `{"error": {"code": 11135, "message": "image rejected"}}`, ErrImageInvalid},
+		// `invalid image_url content` 是上游最常见的图片报错文案，常与 code 11101
+		// 同行（sk c5cdb46 的 invalidImageRule 把它列在首位）。它属**分类**口径的
+		// 图片族（isImageInvalidBody），但不属 hint 口径的 11135 族
+		// （isInvalidImageData）——故 gateway_hint 走 Kind 表的 ErrImageInvalid 文案。
+		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content"}`, ErrImageInvalid},
+		{400, `Parse message failed: invalid image_url content`, ErrImageInvalid},
+		{400, `{"code": 11133, "msg": "other business error"}`, ErrClient},
+		// 429 + code 14018 = 明确的账号积分耗尽（issue #175）：必须先于通用 429
+		// 兜底，否则会被误判为可自愈的软限流并反复兜底选中。仅按结构化 code 判定。
+		{429, `{"code":14018,"msg":"Credits exhausted"}`, ErrHardCredit},
+		{429, `{"code": 14018, "msg":"Credits exhausted"}`, ErrHardCredit},
+		{429, `{"error":{"data":{"code":"14018","msg":"Credits exhausted"}}}`, ErrHardCredit},
+		// 防过宽反例：无 14018 业务码的 429 仍是软限流（文案不得参与判定）。
+		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
+		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
@@ -63,6 +89,43 @@ func TestClassify(t *testing.T) {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
 		}
+	}
+}
+
+// TestErrKindString 错误类别字符串是日志/面板/客户端 code 的稳定契约：
+// 新增类别必须给出稳定标识（image_invalid），不得回落 default 的 "none"。
+func TestErrKindString(t *testing.T) {
+	cases := []struct {
+		kind ErrKind
+		want string
+	}{
+		{ErrImageInvalid, "image_invalid"},
+		{ErrPromptTooLong, "prompt_too_long"},
+		{ErrHardCredit, "hard_credit"},
+		{ErrSoftRate, "soft_rate"},
+		{ErrClient, "client"},
+	}
+	for _, c := range cases {
+		if got := c.kind.String(); got != c.want {
+			t.Errorf("ErrKind(%d).String()=%q want %q", c.kind, got, c.want)
+		}
+	}
+}
+
+// TestGatewayHintImageInvalid 图片无效的 gateway_hint：Kind 表覆盖该类别；
+// 带 11135 业务码的 body 由既有 11135 形态判定优先给出更具体的图片提示
+// （hint.go 的判定次序：业务码形态先于 Kind 表），两者都必须非空且指向图片。
+func TestGatewayHintImageInvalid(t *testing.T) {
+	plain := GatewayHint(ErrImageInvalid, `{"code":1,"msg":"Parse message failed: invalid image_url content"}`, HintContext{})
+	if want := "image request was rejected by upstream; check image_url format and image data"; plain != want {
+		t.Errorf("GatewayHint(ErrImageInvalid, plain)=%q want %q", plain, want)
+	}
+	code := GatewayHint(ErrImageInvalid, `{"code": 11135, "msg":"image rejected"}`, HintContext{})
+	if code == "" {
+		t.Fatal("GatewayHint(ErrImageInvalid, 11135 body) empty; want non-empty image hint")
+	}
+	if !strings.Contains(code, "image") {
+		t.Errorf("GatewayHint(ErrImageInvalid, 11135 body)=%q want image-related hint", code)
 	}
 }
 

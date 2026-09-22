@@ -38,6 +38,7 @@ const (
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                  // 图片请求格式/数据无效（400 + 11135 等）→ 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -63,6 +64,8 @@ func (k ErrKind) String() string {
 		return "waf_block"
 	case ErrPromptTooLong:
 		return "prompt_too_long"
+	case ErrImageInvalid:
+		return "image_invalid"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrClient:
@@ -399,7 +402,7 @@ func ParseRateReset(body string) (time.Time, bool) {
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
-//     （只认 400/404，429+11102 属限流语义走第 4 层）。
+//     （只认 400/404，429+11102 属限流语义走第 5 层）。
 //  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 //  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
@@ -411,21 +414,30 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     限流可指数退避等自愈，账号级故障等不来）。11140 的 model 级限流变体
 //     （rate-limiting 文案）因 marker 不含该文案而天然落到 softRateMarkers 层，
 //     不受影响。
-//  4. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
+//  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit。必须先于下方通用
+//     429 兜底，否则会被误判为可自愈的软限流，在全池冷却时被反复兜底选中、反复
+//     失败。仅按结构化业务码判定（codeMarker 口径，容忍 JSON 空白）；无该 code 的
+//     "credits exhausted" 文案仍保持普通 429 的软限流语义（不靠可能跨计费/限流
+//     两界的文案猜测）。
+//  5. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
 //     "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把
 //     限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词
-//     更权威的信号；真正的余额耗尽由 402（第 1 层）捕获，非 429 状态码的 quota
-//     措辞仍走下方 hardMarkers（第 5 层）。
-//  5. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
-//  6. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     更权威的信号；真正的余额耗尽由 402（第 1 层）或 14018（第 4 层）捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 6 层）。
+//  6. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//  7. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码。
-//  7. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//  8. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
 //     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
-//  8. 404 / 5xx —— 与限流无关的常规分类。
-//  9. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  9. 404 / 5xx —— 与限流无关的常规分类。
+//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
-//  10. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  11. 图片请求无效 —— 400 且 body 命中图片错误族（isImageInvalidBody：11135
+//     codeMarker 口径 ∪ `invalid image_url content` 文案族）：确定性的请求级错误，
+//     同 body 换账号结果不变，判在内容策略/参数错误之前直接 fail-fast（见 handler
+//     的 ErrImageInvalid 透传分支）。
+//  12. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
@@ -451,6 +463,13 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault
 		}
+	}
+	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
+	// 可自愈的软限流并在全池冷却时反复兜底选中（issue #175）。仅按结构化 code
+	// 判定（codeMarker 容忍 JSON 空白），与 hint.go 的 codeMarker 同口径；
+	// 无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
+	if status == http.StatusTooManyRequests && codeMarker(lower, "14018") {
+		return ErrHardCredit
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
 	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
@@ -493,6 +512,14 @@ func Classify(status int, body string) ErrKind {
 	// 带信封的 403 在上方各层已有权威分类，不受影响。
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
+	}
+	// 图片格式/数据错误（HTTP 400）是确定性的请求级错误：同 body 换账号结果不变，
+	// 直接 fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。
+	// 判定走 isImageInvalidBody：比 hint 层的 isInvalidImageData 多覆盖
+	// `invalid image_url content`（上游最常见的图片报错文案，常与 code 11101 同行）；
+	// code 11135 经 codeMarker，天然容忍 `"code": 11135` 的 JSON 空白形态。
+	if status == http.StatusBadRequest && isImageInvalidBody(body) {
+		return ErrImageInvalid
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
