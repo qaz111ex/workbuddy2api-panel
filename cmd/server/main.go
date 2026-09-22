@@ -326,6 +326,13 @@ func panelListenPath(listen string) string {
 	return listen
 }
 
+// configRename 是 os.Rename 的间接层，只为让测试能注入 EBUSY。
+//
+// 背景：Docker 单文件 bind mount 无法被 rename 覆盖（Linux 返回 EBUSY），
+// saveConfig 对此有「就地改写挂载文件」的回退路径。该路径在 Windows 上永远不会
+// 自然触发（Windows 允许 rename 覆盖已存在文件），若不设间接层就永远测不到。
+var configRename = os.Rename
+
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
 //
 // 热生效范围（设计取舍）：
@@ -369,8 +376,32 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return nil, fmt.Errorf("write config: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("replace config: %w", err)
+	if err := configRename(tmp, path); err != nil {
+		// Docker 单文件 bind mount 无法被 rename 覆盖（Linux 返回 EBUSY /
+		// "device or resource busy"）。常规文件仍走上面的原子替换路径，只对这种
+		// 部署形态就地改写挂载文件本身。
+		if !errors.Is(err, syscall.EBUSY) {
+			return nil, fmt.Errorf("replace config: %w", err)
+		}
+		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			_ = os.Remove(tmp)
+			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
+		}
+		_, writeErr := f.Write(out)
+		if writeErr == nil {
+			writeErr = f.Sync()
+		}
+		closeErr := f.Close()
+		// 写失败时**保留 tmp**：挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
+		// 可手工恢复（错误信息带 tmp 路径）；写成功才清理。
+		if writeErr != nil {
+			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
+		}
+		_ = os.Remove(tmp)
+		if closeErr != nil {
+			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
+		}
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。

@@ -17,9 +17,20 @@ CONTAINER="workbuddy2api"
 
 mkdir -p "$AUTH_DIR"
 
-# login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
+# login 工具：缺失、或任一构建输入（*.go / go.mod / go.sum）比它新时重编。
+#
+# 为什么不能只在"不存在时"编译：源码改动后本地二进制会静默停留在旧版本。
+# 这里尤其危险——realm 路由逻辑在 login 二进制里，过期的二进制会把 global 凭证
+# 打向 CN 端点，症状与「token 过期」无法区分（issue #191 同类）。
+# `-print -quit` 让 find 命中即退出，故 `set -o pipefail` 下不会因 grep 提前关闭
+# 管道而吃到 find 的 SIGPIPE（141）。
 LOGIN_BIN="./login"
-if [[ ! -x "$LOGIN_BIN" ]]; then
+if [[ ! -x "$LOGIN_BIN" ]] || find . \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' \) -newer "$LOGIN_BIN" -print -quit | grep -q .; then
+    if ! command -v go >/dev/null 2>&1; then
+        echo "需要 go 构建 login（或镜像内置 /app/login）" >&2
+        exit 1
+    fi
+    echo "build login ..." >&2
     go build -o "$LOGIN_BIN" ./cmd/login
 fi
 
