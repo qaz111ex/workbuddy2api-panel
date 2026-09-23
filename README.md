@@ -463,6 +463,18 @@ curl -s http://localhost:7863/v1/chat/completions \
 - **首选域尝试配额**：首选域最多先试 `MaxRotate-1` 次（默认 2 次），之后把机会让给另一域——国内版有 5 个号全部 5xx 时，国际版号也能轮到，不会把轮转预算耗尽在首选域
 - 单请求轮转预算在有跨域候选且另一域确有账号时 +1，保证首选域账号试完后另一域仍有尝试机会
 - 是否回落以两端**模型目录**（`/v1/models` 探测缓存，零额外上游调用）为准：另一域目录确认没有该模型时不白跑一趟；目录数据不足时乐观尝试
+
+> **国际版模型目录（双 UA 并集探测）**：上游 `/v3/config` 对**不同 User-Agent 下发的
+> 模型集合不同**——`CodeBuddyIDE` 与 `CLI` 两路各有独有模型（IDE 路独有 o4-mini /
+> enhance-1.0 / auto-chat；CLI 路独有 deepseek 系列 / gpt-6-astra / kimi-k2.8-preview）。
+> 网关**并发两路取并集**（IDE 路字段权威、CLI 路补缺失 id），故国际版目录不再缺
+> deepseek 系，且带完整元数据（上下文窗口 / 思考档位 / 倍率）。此外会解析上游的
+> 「N 天免费试用」横幅，把试用模型一并纳入目录。
+>
+> **面板倍率列显示的是「优惠生效价」**：WorkBuddy 客户端展示的是折扣后的生效价
+> （如 `hy4-preview-f` 限时免费 `0x`），而目录 `credits` 是牌价（`x0.29`）。面板现按
+> `modelPromotions`（含 priority 取高、跨午夜 daily 时段、validFrom/Until，时区固定
+> Asia/Shanghai）评估生效价：生效价大字 + 折扣标签 + 划线牌价，悬停显示时段说明。
 - 上游 11102（该域无此模型）且目录确认 → 整个域跳过，立即切另一域，不在同域逐号硬撞
 - 关闭：`global.realm_fallback: false`（严格按前缀/默认域路由）；`global.enabled: false` 为纯 CN 逃生门
 
