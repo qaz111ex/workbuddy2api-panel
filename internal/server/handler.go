@@ -239,11 +239,14 @@ var dynamicModelsCache struct {
 }
 
 const (
-	dynamicModelsTTL        = time.Hour
+	// dynamicModelsTTL 模型目录缓存时长。曾是 1h；缩到 10min 对齐「面板实时、
+	// 公开 API 缓存」的漂移痛点（upstream 79bc5af）：目录新增模型时面板立即可见，
+	// /v1/models 最多滞后一个 TTL。再短就不值得——每次失效都是 2 次上游探测。
+	dynamicModelsTTL        = 10 * time.Minute
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底——
+// models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -414,9 +417,22 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	return h.cfg.Upstream.FetchGlobalModels(acct), acct
 }
 
-// fetchDynamicModels 从池中任一健康 CN 账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
-// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接返回 nil（纯动态，无静态表兜底），
-// 避免反复打上游。只从 CN realm 账号拉取（global 走独立探测）。
+// fetchDynamicModels 从**第一个可用 CN 账号**拉模型列表（含 contextWindow/maxTokens），
+// 缓存 10min。拉取失败记录时间戳进入 5min 负缓存，冷却期内直接返回 nil（纯动态，
+// 无静态表兜底），避免反复打上游。只从 CN realm 账号拉取（global 走独立探测）。
+//
+// 选号与 `/panel/api/models` 的 CN 分支**完全同口径**（AvailableUIDsForRealm("cn")
+// 首个 + AuthByUID），而非加权选号（upstream 79bc5af 的该项，本 fork 采纳）：
+//   - AvailableUIDsForRealm 内部排序，[0] 是**确定性**的（不是随机/加权），故面板与
+//     /v1/models 落到同一个账号、拿到同一份目录——两侧不再出现「两套模型列表」。
+//   - 与面板同口径也意味着可用集合的口径（healthy + 未占满在途）完全一致。
+//
+// 历史注记：本 fork 此前用的是 `PickExcludingForRealm(nil, "", "cn")`——它**已经**按
+// realm 过滤（即 upstream 79bc5af 要修的主缺陷「混合池选中 global 号打 CN 端点」在本
+// fork 不存在，那是 upstream 用无过滤的 Pool.Pick() 才有的问题）。此处改为与面板一致的
+// 确定性取号，是为了收获「两侧同口径」这一副作用，而非修 realm 缺陷。
+// 已知取舍：固定取 [0] 意味着该号异常时目录也失败（进 5min 负缓存），不再随机兜底到
+// 其他号；上游与本 fork 的面板都接受这一点，换取口径一致与探测确定性。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
@@ -431,7 +447,11 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
+	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
+	if len(uids) == 0 {
+		return nil
+	}
+	acct := h.cfg.Pool.AuthByUID(uids[0])
 	if acct == nil {
 		return nil
 	}
@@ -1350,7 +1370,7 @@ func hasImagePart(body []byte) bool {
 //
 // 目录查询只读既有缓存快照（cachedModelsSnapshot），**不触发上游拉取**：错误路径
 // 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
-// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 1h 未
+// 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 10min 未
 // 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
 func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
 	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}
