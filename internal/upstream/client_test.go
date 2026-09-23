@@ -635,6 +635,335 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	}
 }
 
+// --- 试用横幅（ModelTrialBanner，upstream b498416 手工适配）---
+
+// TestFetchV3ConfigTrialBannerModels 试用横幅模型：上游把「N 天免费试用」的模型
+// 只放在 data.productFeaturesConfig.ModelTrialBanner.banners[].modelId，不在
+// data.models 里——纯目录解析会漏（实测 global 侧 hy4-preview-f 即如此，但该模型
+// 实际可调用）。元数据口径：能力字段从 targetModelId 的既有条目继承，Credits/Tags
+// 显式清空（那是「转正后」的计费与营销信息，用在免费试用版上会误导下游）。
+func TestFetchV3ConfigTrialBannerModels(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{
+			"models":[{"id":"hy4-preview","name":"Hy4-Preview","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.29","tags":["badge:限时免费"],"supportsReasoning":true,"reasoning":{"defaultEffort":"high","supportedEfforts":["low","high","max"]}}],
+			"productFeaturesConfig":{"ModelTrialBanner":{"banners":[
+				{"firstUseTimeKey":"hy4.first_user_time","modelId":"hy4-preview-f","targetModelId":"hy4-preview","trialDays":14},
+				{"modelId":"hy4-preview","targetModelId":"hy4-preview"},
+				{"modelId":"   "},
+				{"modelId":"orphan-trial","targetModelId":"not-in-catalog"}
+			]}}
+		}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	out, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	if err != nil {
+		t.Fatalf("fetchV3ConfigModelMap() err = %v", err)
+	}
+	// 试用版：能力字段继承转正目标，计费/营销字段清空。
+	f, ok := out["hy4-preview-f"]
+	if !ok {
+		t.Fatalf("试用横幅模型未补入目录: %+v", out)
+	}
+	if f.ContextWindow != 1000000 || f.MaxTokens != 393216 || f.DefaultEffort != "high" || len(f.Efforts) != 3 {
+		t.Errorf("试用模型能力字段应从 targetModelId 继承: %+v", f)
+	}
+	if f.Credits != "" || f.Tags != nil {
+		t.Errorf("试用模型 Credits/Tags 必须清空（那是转正后的计费与营销信息）: credits=%q tags=%v", f.Credits, f.Tags)
+	}
+	// 转正目标自身不得被试用横幅污染（同 id 已存在 → 跳过）。
+	if base := out["hy4-preview"]; base.Credits != "x0.29" || len(base.Tags) != 1 {
+		t.Errorf("转正目标条目被试用横幅污染: %+v", base)
+	}
+	// targetModelId 不在目录 → 只带 ID 的裸条目（不编造字段）。
+	orphan, ok := out["orphan-trial"]
+	if !ok {
+		t.Fatalf("targetModelId 缺失时仍应补入裸条目: %+v", out)
+	}
+	if orphan.ContextWindow != 0 || orphan.MaxTokens != 0 || orphan.Credits != "" || orphan.Tags != nil {
+		t.Errorf("未知 targetModelId 不得编造字段: %+v", orphan)
+	}
+	// 空/空白 modelId 跳过。
+	if len(out) != 3 {
+		t.Errorf("目录条目数 = %d, want 3（hy4-preview / hy4-preview-f / orphan-trial）: %+v", len(out), out)
+	}
+}
+
+// --- 优惠生效价（modelPromotions，upstream 2b0eedd 的 client.go 侧手工适配）---
+
+// promoAt 构造 promoZone（Asia/Shanghai，UTC+8）墙钟时刻。
+func promoAt(t *testing.T, mo time.Month, d, h, mi int) time.Time {
+	t.Helper()
+	return time.Date(2026, mo, d, h, mi, 0, 0, promoZone)
+}
+
+// TestPromoClock "HH:MM" 解析：合法值转当日分钟数，坏值必须被拒（坏值窗口
+// 若被当成 0 点会让优惠全天生效）。
+func TestPromoClock(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+		ok   bool
+	}{
+		{"00:00", 0, true},
+		{"07:50", 470, true},
+		{"23:00", 1380, true},
+		{" 9:05 ", 545, true},
+		{"07", 0, false},
+		{"07:60", 0, false},
+		{"25:00", 0, false},
+		{"-1:00", 0, false},
+		{"ab:cd", 0, false},
+		{"", 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := promoClock(tc.in)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("promoClock(%q) = (%d, %v), want (%d, %v)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// TestPromoActiveCrossMidnightDaily 跨午夜 daily 时段（23:00→7:50）：必须按
+// 「start > end 即跨午夜」判定，否则整段夜间优惠失效（实测 glm-5.2 夜间折扣）。
+// 边界左闭右开：起点含、终点不含。
+func TestPromoActiveCrossMidnightDaily(t *testing.T) {
+	p := &v3ModelPromotion{
+		Enabled:  true,
+		Schedule: &v3PromoSchedule{Daily: []v3PromoWindow{{Start: "23:00", End: "7:50"}}},
+	}
+	cases := []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{"窗口前一分钟 22:59", promoAt(t, time.September, 23, 22, 59), false},
+		{"窗口起点 23:00", promoAt(t, time.September, 23, 23, 0), true},
+		{"午夜中段 03:00", promoAt(t, time.September, 24, 3, 0), true},
+		{"窗口末端前一分钟 07:49", promoAt(t, time.September, 24, 7, 49), true},
+		{"窗口末端 07:50（右开）", promoAt(t, time.September, 24, 7, 50), false},
+		{"白天 12:00", promoAt(t, time.September, 24, 12, 0), false},
+	}
+	for _, tc := range cases {
+		if got := promoActive(p, tc.at); got != tc.want {
+			t.Errorf("%s: promoActive = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// 非跨午夜窗口（09:00-18:00）同样左闭右开。
+	day := &v3ModelPromotion{
+		Enabled:  true,
+		Schedule: &v3PromoSchedule{Daily: []v3PromoWindow{{Start: "09:00", End: "18:00"}}},
+	}
+	if !promoActive(day, promoAt(t, time.September, 23, 9, 0)) {
+		t.Error("09:00-18:00 窗口起点应生效")
+	}
+	if promoActive(day, promoAt(t, time.September, 23, 18, 0)) {
+		t.Error("09:00-18:00 窗口终点应失效（右开）")
+	}
+}
+
+// TestPromoActiveValidFromUntilBoundary validFrom/validUntil 边界：左闭右开
+// （now == validFrom 生效；now == validUntil 失效），坏值忽略不误伤。
+func TestPromoActiveValidFromUntilBoundary(t *testing.T) {
+	p := &v3ModelPromotion{
+		Enabled: true,
+		Schedule: &v3PromoSchedule{
+			ValidFrom:  "2026-09-23T10:00:00+08:00",
+			ValidUntil: "2026-09-24T10:00:00+08:00",
+		},
+	}
+	cases := []struct {
+		name string
+		at   time.Time
+		want bool
+	}{
+		{"起点前一秒 09:59:59", time.Date(2026, 9, 23, 9, 59, 59, 0, promoZone), false},
+		{"起点当刻 10:00:00", time.Date(2026, 9, 23, 10, 0, 0, 0, promoZone), true},
+		{"区间中段", time.Date(2026, 9, 24, 2, 0, 0, 0, promoZone), true},
+		{"终点前一秒 09:59:59", time.Date(2026, 9, 24, 9, 59, 59, 0, promoZone), true},
+		{"终点当刻 10:00:00", time.Date(2026, 9, 24, 10, 0, 0, 0, promoZone), false},
+	}
+	for _, tc := range cases {
+		if got := promoActive(p, tc.at); got != tc.want {
+			t.Errorf("%s: promoActive = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// 坏值（非 RFC3339）不得把整条优惠判死——解析失败即忽略该边界。
+	bad := &v3ModelPromotion{Enabled: true, Schedule: &v3PromoSchedule{ValidFrom: "not-a-time", ValidUntil: "also-bad"}}
+	if !promoActive(bad, promoAt(t, time.September, 23, 12, 0)) {
+		t.Error("坏 validFrom/validUntil 应被忽略，而非让优惠永久失效")
+	}
+}
+
+// TestPromoActiveFixedShanghaiZone 时段判定固定按 Asia/Shanghai（UTC+8）墙钟，
+// 与传入 time 的 Location 表达无关（容器 UTC 部署不得整体错档）。
+func TestPromoActiveFixedShanghaiZone(t *testing.T) {
+	if _, off := time.Date(2026, 1, 1, 0, 0, 0, 0, promoZone).Zone(); off != 8*3600 {
+		t.Fatalf("promoZone offset = %d, want 28800（Asia/Shanghai UTC+8）", off)
+	}
+	p := &v3ModelPromotion{
+		Enabled:  true,
+		Schedule: &v3PromoSchedule{Daily: []v3PromoWindow{{Start: "00:00", End: "08:00"}}},
+	}
+	// 同一绝对时刻：UTC 20:00 == 上海次日 04:00 → 落在窗口内。
+	utc := time.Date(2026, 9, 23, 20, 0, 0, 0, time.UTC)
+	if !promoActive(p, utc) {
+		t.Error("UTC 20:00（上海 04:00）应落在 00:00-08:00 窗口内——判定未按 Asia/Shanghai 墙钟")
+	}
+	if !promoActive(p, utc.In(promoZone)) {
+		t.Error("同一时刻换 Location 表达不得改变结论")
+	}
+	// 反例：上海本地 20:00（= UTC 12:00）不在窗口内。
+	if promoActive(p, promoAt(t, time.September, 23, 20, 0)) {
+		t.Error("上海 20:00 不应落在 00:00-08:00 窗口内")
+	}
+}
+
+// TestApplyModelPromotionsPriority 同模型多促销取 priority 最高，且与切片顺序
+// 无关；无 discount 的（错峰类）只挂标签/说明，牌价 Credits 不得被覆盖。
+func TestApplyModelPromotionsPriority(t *testing.T) {
+	badgeOnly := v3ModelPromotion{
+		Enabled: true, Priority: 50, ModelIDs: []string{"glm-5.2"},
+		Badge: &v3PromoBadge{Label: "错峰使用"}, Hover: &v3PromoHover{TextZh: "白天说明"},
+	}
+	night := v3ModelPromotion{
+		Enabled: true, Priority: 100, ModelIDs: []string{"glm-5.2"},
+		Badge: &v3PromoBadge{Label: "夜间折扣"}, Hover: &v3PromoHover{TextZh: "夜间说明"},
+		Discount: &v3PromoDiscount{DiscountedCredits: "0.50x", Factor: 0.5},
+	}
+	for _, tc := range []struct {
+		name   string
+		promos []v3ModelPromotion
+	}{
+		{"低优先级在前", []v3ModelPromotion{badgeOnly, night}},
+		{"低优先级在后", []v3ModelPromotion{night, badgeOnly}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]ModelInfo{"glm-5.2": {ID: "glm-5.2", Credits: "x1.00"}}
+			applyModelPromotions(out, tc.promos)
+			mi := out["glm-5.2"]
+			if mi.PromoLabel != "夜间折扣" || mi.PromoNote != "夜间说明" {
+				t.Errorf("priority 最高者应胜出: label=%q note=%q", mi.PromoLabel, mi.PromoNote)
+			}
+			if mi.PromoFactor == nil || *mi.PromoFactor != 0.5 || mi.PromoCredits != "0.50x" {
+				t.Errorf("生效价未挂上: factor=%v credits=%q", mi.PromoFactor, mi.PromoCredits)
+			}
+			if mi.Credits != "x1.00" {
+				t.Errorf("牌价 Credits 不得被生效价覆盖: %q", mi.Credits)
+			}
+		})
+	}
+}
+
+// TestApplyModelPromotionsBadgeOnly 无 discount 对象的条目（错峰类）只挂标签+
+// 说明，PromoFactor 必须留 nil（不得编造 machine-readable 折扣）。
+func TestApplyModelPromotionsBadgeOnly(t *testing.T) {
+	out := map[string]ModelInfo{"deepseek-v4.1-flash": {ID: "deepseek-v4.1-flash", Credits: "x0.03"}}
+	applyModelPromotions(out, []v3ModelPromotion{{
+		Enabled: true, Priority: 10, ModelIDs: []string{"deepseek-v4.1-flash"},
+		Badge: &v3PromoBadge{Label: "错峰使用"}, Hover: &v3PromoHover{TextZh: "每日 23:00-07:50 五折"},
+	}})
+	mi := out["deepseek-v4.1-flash"]
+	if mi.PromoLabel != "错峰使用" || mi.PromoNote != "每日 23:00-07:50 五折" {
+		t.Errorf("badge-only 促销应挂标签+说明: %+v", mi)
+	}
+	if mi.PromoFactor != nil || mi.PromoCredits != "" {
+		t.Errorf("无 discount 对象不得编造生效价: factor=%v credits=%q", mi.PromoFactor, mi.PromoCredits)
+	}
+}
+
+// TestApplyModelPromotionsSkipsInactiveAndUnknown 未启用（enabled=false）的促销
+// 不生效；modelIds 里的目录外模型既不挂标签、也不得被带进目录。
+func TestApplyModelPromotionsSkipsInactiveAndUnknown(t *testing.T) {
+	out := map[string]ModelInfo{"glm-5.2": {ID: "glm-5.2"}}
+	applyModelPromotions(out, []v3ModelPromotion{
+		{Enabled: false, Priority: 100, ModelIDs: []string{"glm-5.2"}, Badge: &v3PromoBadge{Label: "已停用"}},
+		{Enabled: true, Priority: 100, ModelIDs: []string{"off-catalog-model"}, Badge: &v3PromoBadge{Label: "不该出现"}},
+	})
+	if got := out["glm-5.2"].PromoLabel; got != "" {
+		t.Errorf("enabled=false 的促销不得生效: label=%q", got)
+	}
+	if _, ok := out["off-catalog-model"]; ok {
+		t.Error("促销不得把目录外模型带进目录")
+	}
+	if len(out) != 1 {
+		t.Errorf("目录条目数被改变: %d", len(out))
+	}
+}
+
+// TestApplyModelPromotionsAtDailySwitch priority+daily 双轨切换（实测 glm-5.2
+// 白天 badge-only(50) / 夜间五折(100)）：注入时钟证明「哪条生效」确实随时段变，
+// 且同一时刻只有 priority 最高者挂上。没有这个时钟注入，这类断言只能靠真实墙钟。
+func TestApplyModelPromotionsAtDailySwitch(t *testing.T) {
+	promos := []v3ModelPromotion{
+		{Enabled: true, Priority: 50, ModelIDs: []string{"glm-5.2"},
+			Badge: &v3PromoBadge{Label: "错峰使用"}, Hover: &v3PromoHover{TextZh: "白天说明"}},
+		{Enabled: true, Priority: 100, ModelIDs: []string{"glm-5.2"},
+			Badge: &v3PromoBadge{Label: "夜间折扣"}, Discount: &v3PromoDiscount{DiscountedCredits: "0.50x", Factor: 0.5},
+			Schedule: &v3PromoSchedule{Daily: []v3PromoWindow{{Start: "23:00", End: "7:50"}}}},
+	}
+	// 白天：夜间五折不命中，只剩 badge-only。
+	day := map[string]ModelInfo{"glm-5.2": {ID: "glm-5.2", Credits: "x1.00"}}
+	applyModelPromotionsAt(day, promos, promoAt(t, time.September, 23, 12, 0))
+	if day["glm-5.2"].PromoLabel != "错峰使用" || day["glm-5.2"].PromoFactor != nil {
+		t.Errorf("白天应为 badge-only: %+v", day["glm-5.2"])
+	}
+	// 夜间：五折（priority 100）胜出并带上生效价。
+	night := map[string]ModelInfo{"glm-5.2": {ID: "glm-5.2", Credits: "x1.00"}}
+	applyModelPromotionsAt(night, promos, promoAt(t, time.September, 23, 23, 30))
+	mi := night["glm-5.2"]
+	if mi.PromoLabel != "夜间折扣" || mi.PromoFactor == nil || *mi.PromoFactor != 0.5 || mi.PromoCredits != "0.50x" {
+		t.Errorf("夜间应为五折生效价: %+v", mi)
+	}
+}
+
+// TestFetchV3ConfigModelMapAppliesPromotions 端到端（JSON → 目录 → 生效价）：
+// 目录 credits 是牌价，modelPromotions 才是客户端显示的生效价；两处合起来
+// 复现实测形态——hy4-preview-f 牌价 x0.29（转正价）但试用期生效价 0x「限时免费」。
+func TestFetchV3ConfigModelMapAppliesPromotions(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{
+			"models":[
+				{"id":"hy4-preview","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.29","tags":["badge:限时免费"]},
+				{"id":"glm-5.2","maxInputTokens":1000000,"maxOutputTokens":48000,"credits":"x1.00"}
+			],
+			"productFeaturesConfig":{"ModelTrialBanner":{"banners":[
+				{"modelId":"hy4-preview-f","targetModelId":"hy4-preview","trialDays":14}
+			]}},
+			"modelPromotions":[
+				{"enabled":true,"priority":100,"modelIds":["hy4-preview-f"],"badge":{"label":"限时免费"},"hover":{"textZh":"试用期内 0 积分"},"discount":{"factor":0,"discountedCredits":"0x"},"schedule":{"timezone":"Asia/Shanghai"}},
+				{"enabled":false,"priority":999,"modelIds":["hy4-preview-f"],"badge":{"label":"已停用"},"discount":{"factor":9,"discountedCredits":"9x"}}
+			]
+		}}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	out, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	if err != nil {
+		t.Fatalf("fetchV3ConfigModelMap() err = %v", err)
+	}
+	f, ok := out["hy4-preview-f"]
+	if !ok {
+		t.Fatalf("试用横幅模型缺失: %+v", out)
+	}
+	// 牌价：试用版本身 Credits 清空（banner 口径），转正目标仍是 x0.29。
+	if f.Credits != "" {
+		t.Errorf("试用版牌价应为空（banner 清空）: %q", f.Credits)
+	}
+	if base := out["hy4-preview"]; base.Credits != "x0.29" {
+		t.Errorf("转正目标牌价 x0.29 应保留: %q", base.Credits)
+	}
+	// 生效价：限时免费 0x（enabled=false 的高 priority 条目不得胜出）。
+	if f.PromoFactor == nil || *f.PromoFactor != 0 {
+		t.Fatalf("生效价应为 factor=0（限时免费）: %+v", f)
+	}
+	if f.PromoCredits != "0x" || f.PromoLabel != "限时免费" || f.PromoNote != "试用期内 0 积分" {
+		t.Errorf("生效价展示字段错误: %+v", f)
+	}
+	// 无促销的模型不得被挂上任何 Promo 字段。
+	if g := out["glm-5.2"]; g.PromoFactor != nil || g.PromoLabel != "" || g.PromoCredits != "" || g.PromoNote != "" {
+		t.Errorf("无促销模型不应有 Promo 字段: %+v", g)
+	}
+}
+
 // TestRefreshTokenExpiresInSanityCap expiresIn 量级上限：上游脏值（如
 // 99999999999 秒 ≈ 3170 年）不得把 ExpiresAt 推到荒谬未来（NeedsRefresh 永假
 // → token 永不刷新反而真过期失效）。依据 pr134-watchlist-analysis.md #4 可选加固：

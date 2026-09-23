@@ -3,6 +3,7 @@ package upstream
 import (
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,9 +164,9 @@ func TestParseGlobalModelNamesKeepsReasoning(t *testing.T) {
 	}
 }
 
-// snapshotTestClient 返回一个 global 探测可用的 Client：两路探测（/v3/config 与
-// /v2 企业路）都指向同一个 fake，并统计请求次数（只读快照必须零新请求）。
-// 本 fork 的 global 探测是 v3 + 企业家族并发，两路都会打同一个 host。
+// snapshotTestClient 返回一个 global 探测可用的 Client：探测各路（/v3/config 的
+// IDE + CLI 双 UA、/v2 企业路）都指向同一个 fake，并统计请求次数（只读快照必须零新请求）。
+// 本 fork 的 global 探测是 v3 双 UA + 企业家族并发，三路都会打同一个 host。
 func snapshotTestClient(t *testing.T, body string) (*Client, *int) {
 	t.Helper()
 	inner := rtFunc(func(r *http.Request) (*http.Response, error) {
@@ -187,7 +188,7 @@ func snapshotTestClient(t *testing.T, body string) (*Client, *int) {
 
 // TestGlobalModelInfosSnapshotReadOnly 只读快照的三个契约（issue #176 T1）：
 //   - (a) 冷客户端（从未探测）→ 快照 nil，零上游请求（绝不主动探测）；
-//   - (b) 一次 FetchGlobalModelInfos 预热（v3 + /v2 并发两请求）→ 快照返回
+//   - (b) 一次 FetchGlobalModelInfos 预热（v3 双 UA + /v2 企业路并发三请求）→ 快照返回
 //     同一批全字段 infos（含 credits 原文）；
 //   - (c) 预热后反复读快照 → fake 请求计数不变（只读，与 Fetch* 的 miss 即探测
 //     语义相反——本方法服务 /v1/stats，缓存冷就冷，不发起网络）。
@@ -289,4 +290,189 @@ func findInfo(infos []ModelInfo, id string) *ModelInfo {
 		}
 	}
 	return nil
+}
+
+// --- /v3/config 双 UA 并发探测（upstream 9dce68a 手工适配）---
+
+// globalProbeAuth 探测用的 global 账号：domain 后缀 .workbuddy.ai → Realm()==global。
+func globalProbeAuth() *auth.Auth {
+	return &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+}
+
+// dualUAProbeClient 构造 global 探测用 Client：/v3/config 按 UA 分派 body，
+// 企业端点固定 500（隔离出 v3 双路行为，使断言不受企业路影响）。
+// 返回客户端与两路 v3 调用计数（探测是三路并发，计数必须原子）。
+func dualUAProbeClient(t *testing.T, ideBody, cliBody string) (*Client, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+	var ideCalls, cliCalls atomic.Int32
+	c := &Client{
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v3/config") {
+				switch r.Header.Get("User-Agent") {
+				case codeBuddyIDEUA:
+					ideCalls.Add(1)
+					return jsonResp(200, ideBody), nil
+				case codeBuddyCLIUA:
+					cliCalls.Add(1)
+					return jsonResp(200, cliBody), nil
+				}
+				t.Errorf("v3/config UA = %q, want IDE 或 CLI UA", r.Header.Get("User-Agent"))
+				return jsonResp(200, `{"code":0,"data":{"models":[{"id":"unexpected-ua-model"}]}}`), nil
+			}
+			return jsonResp(500, `enterprise down`), nil
+		})},
+		ChatBaseCN:     "https://chat.example",
+		ChatBaseGlobal: "https://global.example",
+		GlobalEnabled:  true,
+	}
+	return c, &ideCalls, &cliCalls
+}
+
+// TestProbeGlobalModelsDualUAUnion 双 UA 并集（9dce68a 的核心价值）：/v3/config
+// 对 IDE/CLI UA 下发的**模型集合不同**，两路各有独有模型，必须并发两路取并集
+// （单纯换 UA 会丢掉另一路的独有模型）。同时验证共享 id 的字段以 IDE 路为权威
+// （IDE 路单条字段更全），CLI 独有 id 的对象元数据也要一并带回。
+func TestProbeGlobalModelsDualUAUnion(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	c, ideCalls, cliCalls := dualUAProbeClient(t,
+		`{"code":0,"data":{"models":[
+			{"id":"o4-mini","maxInputTokens":200000,"maxOutputTokens":100000},
+			{"id":"shared-model","maxInputTokens":1000000,"maxOutputTokens":393216}
+		]}}`,
+		`{"code":0,"data":{"models":[
+			{"id":"deepseek-v4.1-flash-sg","maxInputTokens":1000000,"maxOutputTokens":393216},
+			{"id":"kimi-k2.8-preview","maxInputTokens":256000,"maxOutputTokens":64000},
+			{"id":"shared-model","maxInputTokens":1000000,"maxOutputTokens":128000}
+		]}}`)
+
+	names, infos, _, _, err := c.probeGlobalModels(globalProbeAuth())
+	if err != nil {
+		t.Fatalf("probeGlobalModels() err = %v", err)
+	}
+	// 并集必须同时含 IDE 独有（o4-mini）与 CLI 独有（deepseek-v4.1-flash-sg /
+	// kimi-k2.8-preview）——任一路独有模型丢失即回归到单路缺陷。
+	for _, want := range []string{"o4-mini", "deepseek-v4.1-flash-sg", "kimi-k2.8-preview", "shared-model"} {
+		if !containsStr(names, want) {
+			t.Errorf("并集缺少 %s: %v", want, names)
+		}
+	}
+	if got := ideCalls.Load(); got != 1 {
+		t.Errorf("IDE UA 路探测 %d 次, want 1", got)
+	}
+	if got := cliCalls.Load(); got != 1 {
+		t.Errorf("CLI UA 路探测 %d 次, want 1", got)
+	}
+	// 共享 id：字段以 IDE 路权威（CLI 路的精简值 128000 不得覆盖 IDE 的 393216）。
+	if mi := findInfo(infos, "shared-model"); mi == nil || mi.MaxTokens != 393216 {
+		t.Errorf("shared-model 应以 IDE 路字段为准（MaxTokens=393216）: %+v", mi)
+	}
+	// CLI 独有 id：补 id 的同时必须补对象元数据（不是只补名单）。
+	if mi := findInfo(infos, "kimi-k2.8-preview"); mi == nil || mi.ContextWindow != 256000 || mi.MaxTokens != 64000 {
+		t.Errorf("CLI 独有模型元数据丢失: %+v", mi)
+	}
+}
+
+// TestProbeGlobalModelsSingleUADegradation 单路失败降级：一路非 2xx 时不得
+// 拖累另一路（结果 = 成功一路），但**两路都必须被尝试过**——失败一路若不发
+// 请求，就永远无从知道它有没有独有模型。
+func TestProbeGlobalModelsSingleUADegradation(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	const (
+		ideBody = `{"code":0,"data":{"models":[{"id":"o4-mini","maxInputTokens":200000,"maxOutputTokens":100000}]}}`
+		cliBody = `{"code":0,"data":{"models":[{"id":"deepseek-v4.1-flash-sg","maxInputTokens":1000000,"maxOutputTokens":393216}]}}`
+	)
+	cases := []struct {
+		name       string
+		ideStatus  int
+		ideBody    string
+		cliStatus  int
+		cliBody    string
+		wantID     string
+		wantAbsent string
+	}{
+		{"IDE 路失败 → 降级 CLI 路", 500, "", 200, cliBody, "deepseek-v4.1-flash-sg", "o4-mini"},
+		{"CLI 路失败 → 降级 IDE 路", 200, ideBody, 500, "", "o4-mini", "deepseek-v4.1-flash-sg"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ideCalls, cliCalls atomic.Int32
+			c := &Client{
+				HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+					if !strings.HasSuffix(r.URL.Path, "/v3/config") {
+						return jsonResp(500, `enterprise down`), nil
+					}
+					switch r.Header.Get("User-Agent") {
+					case codeBuddyIDEUA:
+						ideCalls.Add(1)
+						return jsonResp(tc.ideStatus, tc.ideBody), nil
+					case codeBuddyCLIUA:
+						cliCalls.Add(1)
+						return jsonResp(tc.cliStatus, tc.cliBody), nil
+					}
+					t.Errorf("v3/config UA = %q, want IDE 或 CLI UA", r.Header.Get("User-Agent"))
+					return jsonResp(404, `{}`), nil
+				})},
+				ChatBaseCN:     "https://chat.example",
+				ChatBaseGlobal: "https://global.example",
+				GlobalEnabled:  true,
+			}
+			names, _, _, _, err := c.probeGlobalModels(globalProbeAuth())
+			if err != nil {
+				t.Fatalf("单路成功不应报错: %v", err)
+			}
+			if !containsStr(names, tc.wantID) {
+				t.Errorf("降级结果缺少 %s: %v", tc.wantID, names)
+			}
+			if containsStr(names, tc.wantAbsent) {
+				t.Errorf("失败一路的模型不应出现: %v", names)
+			}
+			if ideCalls.Load() != 1 || cliCalls.Load() != 1 {
+				t.Errorf("两路都应各探测 1 次: ide=%d cli=%d", ideCalls.Load(), cliCalls.Load())
+			}
+		})
+	}
+}
+
+// TestFetchGlobalModelsBothUAFailNegativeCache 两路 v3 全失败 + 企业路失败 →
+// 走原有负缓存语义（无名单、5min 冷却、冷却期内零上游调用）。这条同时钉住
+// 「两路 v3 都要发请求」：只试一路会把另一路的独有模型永久漏掉。
+func TestFetchGlobalModelsBothUAFailNegativeCache(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	var v3Calls atomic.Int32
+	c := &Client{
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v3/config") {
+				v3Calls.Add(1)
+			}
+			return jsonResp(500, `upstream down`), nil
+		})},
+		ChatBaseCN:     "https://chat.example",
+		ChatBaseGlobal: "https://global.example",
+		GlobalEnabled:  true,
+	}
+	if names := c.FetchGlobalModels(globalProbeAuth()); len(names) != 0 {
+		t.Fatalf("全失败必须返回无名单（不回落静态）: %v", names)
+	}
+	if got := v3Calls.Load(); got != 2 {
+		t.Errorf("/v3/config 探测 %d 次, want 2（IDE + CLI 两路）", got)
+	}
+	c.globalModels.Lock()
+	failed := !c.globalModels.lastFail.IsZero()
+	c.globalModels.Unlock()
+	if !failed {
+		t.Error("全失败必须落负缓存（lastFail）")
+	}
+	// 负缓存命中：冷却期内再调不得打上游。
+	if names := c.FetchGlobalModels(globalProbeAuth()); len(names) != 0 {
+		t.Fatalf("负缓存期内应返回 nil: %v", names)
+	}
+	if got := v3Calls.Load(); got != 2 {
+		t.Errorf("负缓存期内又打了上游: %d 次", got)
+	}
 }
