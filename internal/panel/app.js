@@ -409,7 +409,7 @@ $('btnLogPin').onclick = () => {
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
-  listen: ['listen'], api_key: ['api_key'],
+  listen: ['listen'], api_key: ['api_key'], panel_key: ['panel_key'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
@@ -505,6 +505,12 @@ $('btnEye').onclick = () => {
   el.type = show ? 'text' : 'password';
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
+$('btnEyePanel').onclick = () => {
+  const el = $('cfgPanelKey');
+  const show = el.type === 'password';
+  el.type = show ? 'text' : 'password';
+  $('btnEyePanel').textContent = show ? '隐藏' : '显示';
+};
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
@@ -523,8 +529,12 @@ $('cfgForm').onsubmit = async ev => {
     const r = await api('config', { method: 'POST', body: JSON.stringify(collectConfig()) });
     const n = (r.restart_required || []).length;
     toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-    // 密钥可能已改：本次会话沿用新值，避免下一次轮询被 401。
-    const k = $('cfgKey').value.trim();
+    // 面板自身的凭据是 panel_key（管理面）；未设置时回落 api_key。把**保存后实际
+    // 生效**的那个存进 localStorage：输入框留空 = 沿用磁盘上的旧 panel_key（表单只
+    // 提交非空值），故留空时取 cfgLoaded 里的值；两者都没有才用 api_key。
+    // 不这样做，保存后下一次轮询仍带旧 key → 立刻 401。
+    const pk = $('cfgPanelKey').value.trim() || String((cfgLoaded && cfgLoaded.panel_key) || '').trim();
+    const k = pk || $('cfgKey').value.trim();
     if (k) localStorage.setItem(LS_KEY, k);
     loadConfig();
     loadOverview(true);

@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.15.0-panel"
+const appVersion = "1.16.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -223,9 +223,10 @@ func main() {
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
-	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	// live 承载可热改字段（api_key/panel_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		PanelKey:             cfg.PanelKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RealmFallback:        cfg.Global.RealmFallback,
@@ -245,6 +246,7 @@ func main() {
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,
+		PanelKey:    cfg.PanelKey,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
@@ -305,7 +307,21 @@ func main() {
 	if lerr != nil {
 		log.Fatalf("listen %s: %v", cfg.Listen, lerr)
 	}
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	log.Printf("workbuddy2api listening on %s (api_key=%v, panel_key=%v)，管理面板 http://127.0.0.1%s/panel/",
+		cfg.Listen, cfg.APIKey != "", cfg.PanelKey != "", panelListenPath(cfg.Listen))
+	// 管理面/数据面密钥分离告警。为什么只告警不阻断：panel_key 是新增项，现有用户
+	// 的 config.json 里没有它——若因此拒绝启动或让面板打不开，等于用一次升级锁死
+	// 所有老用户。故缺省保持历史行为（面板复用 api_key），但把风险明确喊出来。
+	switch {
+	case cfg.PanelKey == "" && cfg.APIKey == "":
+		log.Printf("[安全告警] api_key 与 panel_key 均为空 = /v1/* 与面板 /panel/* 都不鉴权。" +
+			"若监听地址不止本机，请至少设置 api_key（数据面凭证）与 panel_key（管理面凭证）")
+	case cfg.PanelKey == "":
+		log.Printf("[安全告警] 未设置 panel_key：面板 /panel/* 当前复用数据面 api_key 鉴权——" +
+			"而 api_key 必须交给客户端（opencode / Claude Code 等），任何拿到它的客户端/日志/截图" +
+			"都能打开面板读到全部账号（uid/昵称/余额）并改动账号池与配置。" +
+			"建议在 config.json 顶层加 \"panel_key\": \"<独立密钥>\"（与 api_key 同层，面板内可热改，无需重启）")
+	}
 	if err := serveUntilShutdown(srv, ln, ctx, time.Duration(cfg.ShutdownGraceSeconds)*time.Second, p.Flush); err != nil {
 		log.Fatalf("http: %v", err)
 	}
@@ -366,7 +382,7 @@ var configRename = os.Rename
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
 //
 // 热生效范围（设计取舍）：
-//   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
+//   - api_key / panel_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
 //
@@ -437,6 +453,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		PanelKey:             newCfg.PanelKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RealmFallback:        newCfg.Global.RealmFallback,

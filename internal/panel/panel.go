@@ -4,8 +4,11 @@
 //
 // 设计约束：
 //   - 前端 go:embed 单文件（index.html），无任何外部构建依赖，与二进制同体部署；
-//   - 鉴权复用网关 api_key（Bearer），与 /v1/* 同一口径；api_key 为空 = 不鉴权
-//     （仅本机/私网使用）。面板 HTML 本身无秘密，可匿名加载，密钥只发给 /panel/api/*；
+//   - 鉴权用**管理面**密钥（Bearer）：panel_key 非空时只认它；为空时回落复用网关
+//     api_key（历史行为，升级后不设也不会打不开面板）。数据面 /v1/* 恒只认 api_key
+//     ——两者严格分离，避免"必须外发给客户端的数据面凭证 = 账号池管理权"。
+//     两 key 都为空 = 不鉴权（仅本机/私网使用）。面板 HTML 本身无秘密，可匿名加载，
+//     密钥只发给 /panel/api/*；
 //   - 不改写既有池语义：所有运维操作落到 pool 已有入口（Revive/Disable/Remove...），
 //     添加账号走 auth.SaveAtomic + pool.Add，重启后与 auths/ 目录天然对齐。
 package panel
@@ -37,9 +40,12 @@ type Config struct {
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
-	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	APIKey    string               // 数据面（/v1/*）密钥；面板在 PanelKey 为空时回落复用它
+	// PanelKey 管理面（/panel/*）独立密钥。非空 = 面板只认它（数据面 api_key 打不开
+	// 面板）；空 = 回落复用 APIKey（历史行为）。与 APIKey 同时给出 Live 时 Live 优先。
+	PanelKey  string
+	RedisMode string // "upstash" / "noop"，仅观测透出
+	Version   string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -189,11 +195,14 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
-// api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
+// 生效密钥为空时放行。密钥经 livecfg 快照读取：面板里改了 panel_key，下一个请求
 // 即用新值（无需重启）。
+//
+// 注意：这里用的是**管理面**密钥 panelKey()，不是数据面 api_key——后者必须外发给
+// 客户端，不该同时是账号池的管理凭证（见 panelKey 注释）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		if !httpauth.VerifyBearer(r, p.panelKey()) {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}
@@ -201,12 +210,33 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// apiKey 当前生效密钥（Live 优先，回落静态字段）。
+// apiKey 当前生效的数据面密钥（Live 优先，Live 为 nil 才回落静态字段）。
 func (p *Panel) apiKey() string {
 	if p.cfg.Live != nil {
 		return p.cfg.Live.Load().APIKey
 	}
 	return p.cfg.APIKey
+}
+
+// panelKey 当前生效的管理面（/panel/*）密钥：
+//   - panel_key 非空 → 用它（严格分离：数据面 api_key 打不开面板）；
+//   - panel_key 为空 → 回落复用数据面 api_key（历史行为，现有用户升级后不设也能进面板）；
+//   - 两者都为空 → 返回 ""，withAuth 放行 = 不鉴权（与现状一致）。
+//
+// 读取路径与 apiKey() 完全同口径（Live 优先，Live 为 nil 才回落静态字段），因此
+// 面板里改 panel_key 后下一个请求立即生效，且**清空 panel_key 会立即回到复用
+// api_key 的回落语义**（不是卡在启动值上）。
+func (p *Panel) panelKey() string {
+	if p.cfg.Live != nil {
+		if k := p.cfg.Live.Load().PanelKey; k != "" {
+			return k
+		}
+		return p.apiKey() // 未设 panel_key → 复用数据面密钥
+	}
+	if p.cfg.PanelKey != "" {
+		return p.cfg.PanelKey
+	}
+	return p.apiKey()
 }
 
 // ---------------------------------------------------------------------------
@@ -221,9 +251,11 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		sticky = p.cfg.StickyCount()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         p.cfg.Version,
-		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
+		"version":    p.cfg.Version,
+		"uptime_sec": int(time.Since(p.started).Seconds()),
+		// auth_required 描述**面板自身**是否需要密钥：panel_key 非空、或回落复用
+		// api_key 非空时为 true（面板两个 key 都为空 = 不鉴权）。
+		"auth_required":   p.panelKey() != "",
 		"redis_mode":      p.cfg.RedisMode,
 		"sticky_sessions": sticky,
 		"total":           total,

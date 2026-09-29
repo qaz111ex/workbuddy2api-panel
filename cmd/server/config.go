@@ -18,9 +18,28 @@ import (
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
+	APIKey    string `json:"api_key"`    // 数据面（/v1/*）鉴权密钥；空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// PanelKey 管理面（/panel/*）独立鉴权密钥，与 api_key 同层。
+	//
+	// 为什么需要它（安全设计问题，非边角）：api_key 是**必须交给客户端**的数据面
+	// 凭证（opencode / Claude Code / 各类 SDK 都要填），而它此前同时是面板的完全
+	// 管理凭证。于是任何拿到数据面 key 的客户端、日志、截图，都等于拿到整个账号池
+	// 的管理权——GET /panel/api/status 会吐出全部账号的 uid/昵称/余额/限流状态，
+	// 面板端点还能改动账号池与配置（改冷却、禁用/复活账号、改 api_key 本身）。
+	// 把管理面 key 拆出来，数据面 key 就可以安全外发。
+	//
+	// 语义：
+	//   - 非空：/panel/* 只接受 panel_key，/v1/* 只接受 api_key（严格分离，互不认
+	//     对方的 key）。
+	//   - 空（缺省）：保持历史行为——面板回落复用 api_key；启动日志会告警建议设置，
+	//     但绝不因此让现有用户升级后打不开面板。
+	//   - api_key 与 panel_key 都为空 = 不鉴权（仅本机/私网使用）。
+	//
+	// 热改：与 api_key 同口径走 internal/livecfg 快照，面板保存后下一个请求即生效。
+	PanelKey string `json:"panel_key"`
 
 	// ShutdownGraceSeconds 收到 SIGINT/SIGTERM 后，等待在途请求自然结束的上限秒数。
 	//
@@ -338,6 +357,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_API_KEY"); v != "" {
 		c.APIKey = v
+	}
+	if v := os.Getenv("WB2A_PANEL_KEY"); v != "" {
+		c.PanelKey = v
 	}
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
 		c.AuthDir = v

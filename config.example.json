@@ -1,6 +1,7 @@
 {
   "listen": ":7863",
   "api_key": "test_key",
+  "panel_key": "",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "shutdown_grace_seconds": 5,
