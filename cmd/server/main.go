@@ -23,6 +23,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -31,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.16.0-panel"
+const appVersion = "1.17.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -177,6 +178,8 @@ func main() {
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		// 成长任务队列每日自动执行（默认 1 点，避开 0 点解锁竞态）。
+		GrowthHours: cfg.Schedule.GrowthHours,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -184,6 +187,7 @@ func main() {
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
+		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -239,6 +243,20 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	// 请求级可观测性：内存指标恒开（极廉价），JSONL 归档按配置开关。
+	// Archive 目录与 state/usage 同目录（data/requests），随数据一起备份/清理。
+	reqCfg := reqlog.Config{
+		Enabled:       cfg.Logging.RequestArchiveEnabled,
+		RetentionDays: cfg.Logging.RequestRetentionDays,
+		MaxBytes:      int64(cfg.Logging.RequestArchiveMaxMB) << 20,
+	}
+	if reqCfg.Enabled {
+		reqCfg.Dir = filepath.Join(filepath.Dir(cfg.StateFile), "requests")
+	}
+	reqRec := reqlog.New(reqCfg)
+	// 清理 goroutine 在 ctx 就绪后再起（见下方 startReqlogCleanup）。
+	defer reqRec.Close()
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -247,6 +265,7 @@ func main() {
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,
 		PanelKey:    cfg.PanelKey,
+		Requests:    reqRec,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
@@ -265,6 +284,15 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
+	// 成长任务队列每日自动执行：把面板的执行入口挂到 scheduler 的到点回调上。
+	// 面板构造晚于 scheduler（SetGrowthHook 是事后挂载），方法值类型与 hook 签名一致。
+	// 与手动「执行全部待办」走**同一套队列状态机**（含占位/陈旧占位兜底/无待办回滚），
+	// 所以自动与手动不会互相打架、也不会重复启动。
+	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
+	// 最早到期优先路由：优先花掉快过期的积分（过期即作废）。
+	// 窗口复用既有的 pool.expiring_soon（采集侧早已按它分桶）；窗口 <=0 = 关闭。
+	p.SetPreferExpiring(cfg.ExpiringSoonDur > 0, cfg.ExpiringSoonDur)
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
@@ -282,12 +310,32 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 跨域回落：首选域账号耗尽时自动改用另一域的同名模型账号（缺省 true）。
 		RealmFallback: cfg.Global.RealmFallback,
+		// Anthropic 兼容层：未命中目录的 claude-* 模型名兜底替换（默认空 = 关闭，
+		// 保持既有语义；开启后替换事实会在响应里标注）。
+		AnthropicDefaultModel: cfg.Anthropic.DefaultModel,
+		AnthropicDefaultRealm: cfg.Anthropic.DefaultRealm,
+		// 请求级可观测性（元数据，无内容/凭证）。
+		Requests: reqRec,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// 请求归档清理：启动一次（回收上次未清完的）+ 之后每小时一次，随 ctx 退出。
+	go func() {
+		reqRec.Cleanup()
+		tk := time.NewTicker(time.Hour)
+		defer tk.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				reqRec.Cleanup()
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -466,12 +514,17 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（issue #136）
+	// 最早到期优先路由热生效：窗口复用 pool.expiring_soon（<=0 = 关闭）。
+	p.SetPreferExpiring(newCfg.ExpiringSoonDur > 0, newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	// 成长任务排程热生效。Reconfigure 是 10 个位置实参的既有签名，追加会强制同步改
+	// 所有调用点，故用独立的 SetGrowthSchedule（空 hours 保留原值 + poke rearm）。
+	sch.SetGrowthSchedule(newCfg.Schedule.GrowthHours, !newCfg.Schedule.GrowthEnabled)
 
 	return restartRequiredFields(newCfg), nil
 }
@@ -495,6 +548,9 @@ func restartRequiredFields(c *Config) []string {
 		out = append(out, "upstash")
 	}
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	// Anthropic 默认模型替换在装配期被写进 server.Config（静态字段），未走 livecfg
+	// 快照，故面板改它需要重启——如实列出，不做「看起来热生效其实没变」的假象。
+	out = append(out, "anthropic.default_model", "anthropic.default_realm")
 	return out
 }
 

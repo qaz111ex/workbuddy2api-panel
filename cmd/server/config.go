@@ -81,6 +81,11 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		// GrowthHours 成长任务队列的每日自动执行时点（默认 [1]）。
+		//
+		// 为什么默认 **1 点**而不是 0 点：Sequential 小程序任务族每日**零点解锁**一环，
+		// 0 点整触发正好撞上解锁竞态（上游可能还没下发新环），故避到 1 点。
+		GrowthHours []int `json:"growth_hours"`
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -95,6 +100,12 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+		// GrowthEnabled 成长任务队列每日自动执行开关（缺省 true）。
+		//
+		// 为什么默认开：Sequential 链**每日才解锁一环**，不自动跑就必须用户每天手点一次，
+		// 否则任务链原地不动（少拿积分）。这与本网关其它自动化（签到/旅行/活跃/保活/
+		// 夜猫子）默认开的口径一致。禁用后仍可在面板手动「执行全部待办」。
+		GrowthEnabled bool `json:"growth_enabled"`
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
@@ -167,6 +178,38 @@ type Config struct {
 	// PromptText 解析后的系统提示词文本（custom 模式使用）。
 	PromptText string `json:"-"`
 
+	// Anthropic Anthropic Messages 兼容层（`/v1/messages`）的行为配置。
+	Anthropic struct {
+		// DefaultModel 未命中网关目录的模型名（典型：Claude Code 默认发的
+		// `claude-sonnet-4-*` 这类 Anthropic 原生名）自动替换成的模型。
+		//
+		// 为什么需要：网关目录里没有 `claude-*`，Claude Code 不改配置就必然失败——
+		// 用户得手工设 ANTHROPIC_MODEL 才能用。配上本项后可开箱即用。
+		//
+		// 默认**空 = 关闭**（不做任何隐式替换）：静默改写模型名会让人困惑
+		// 「我要的是 sonnet，怎么答的是别的模型」，故必须显式开启；开启后替换事实
+		// 会在响应里如实标注（见 compat 层），不偷偷改。
+		DefaultModel string `json:"default_model"`
+		// DefaultRealm 替换出的模型名是否带域前缀："cn" / "global" / 空（不带前缀，
+		// 走默认域 + 跨域回落）。仅在 DefaultModel 非空时有意义。
+		DefaultRealm string `json:"default_realm"`
+	} `json:"anthropic"`
+
+	// Logging 请求级可观测性配置。
+	Logging struct {
+		// RequestArchiveEnabled 请求**元数据** JSONL 归档开关（缺省 true）。
+		//
+		// 只归档元数据：请求 id / 路径 / 账号标签（昵称+uid8，非完整 uid）/ 模型 /
+		// 状态码 / 耗时 / 重试次数 / token 计数 / 扣费。**绝不**写提示词、响应正文、
+		// Authorization 或任何凭证（由结构体字段缺失保证，不是靠事后过滤）。
+		RequestArchiveEnabled bool `json:"request_archive_enabled"`
+		// RequestRetentionDays 归档保留天数（缺省 7，<=0 回落 7）。
+		RequestRetentionDays int `json:"request_retention_days"`
+		// RequestArchiveMaxMB 归档总容量上限 MiB（缺省 100，<=0 回落 100）；
+		// 超限优先删最旧文件。
+		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+	} `json:"logging"`
+
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
@@ -232,6 +275,8 @@ func Default() *Config {
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
+	// 成长任务队列每日自动执行：默认 1 点（避开 0 点整的解锁竞态）。
+	c.Schedule.GrowthHours = []int{1}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -239,8 +284,14 @@ func Default() *Config {
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BlackcatEnabled = true
+	c.Schedule.GrowthEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	// 请求元数据归档缺省开：不落盘的话「刚才那个 5xx 是谁」永远查不到，而元数据
+	// 归档有保留天数 + 容量双上限，不会无限增长（且不含任何内容/凭证）。
+	c.Logging.RequestArchiveEnabled = true
+	c.Logging.RequestRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 100
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -534,6 +585,26 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
 	}
+	// GrowthHours 的默认回落必须**独立成一条**，不能像上游 5f6c7ca 修掉的那处 bug
+	// 一样嵌在别的分支里：上游曾把它写在 `if len(BlackcatHours)==0 {...}` 的**内部**，
+	// 于是「用户显式配了 blackcat_hours」时 growth_hours 永远拿不到默认值（静默失效）。
+	// 本仓库从一开始就分开写，此处显式标注以免后人"顺手合并"。
+	if len(c.Schedule.GrowthHours) == 0 {
+		c.Schedule.GrowthHours = []int{1}
+	}
+	// 请求归档：保留天数 / 容量上限 <=0（含键缺席的零值）一律回落默认。
+	if c.Logging.RequestRetentionDays <= 0 {
+		c.Logging.RequestRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 100
+	}
+	// Anthropic 默认模型替换：只在 DefaultModel 非空时启用；realm 只接受 cn/global/空。
+	switch c.Anthropic.DefaultRealm {
+	case "", "cn", "global":
+	default:
+		return fmt.Errorf("anthropic.default_realm %q 无效：只接受 \"cn\"/\"global\"/空", c.Anthropic.DefaultRealm)
+	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
 		if c.Schedule.BalanceRefreshMinutes <= 0 {
@@ -592,7 +663,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours)
+	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

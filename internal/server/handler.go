@@ -19,6 +19,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -43,6 +44,23 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+
+	// AnthropicDefaultModel 非空 = 对 `/v1/messages` 上「未命中网关目录的原生
+	// Anthropic 模型名」（典型：Claude Code 默认发的 `claude-sonnet-4-*`）启用兜底
+	// 替换。空 = 完全不做隐式替换（默认，保持既有语义）。
+	//
+	// 为什么是 opt-in：静默改写模型名会让人困惑「我要的是 sonnet，怎么答的是别的
+	// 模型」；开启后替换事实会在响应里如实标注（见 compat 层），不偷偷改。
+	// 只影响 /v1/messages —— /v1/responses 与 /v1/chat/completions 的客户端本来就
+	// 填真实模型名，不做隐式替换。
+	AnthropicDefaultModel string
+	// AnthropicDefaultRealm 替换出的模型名是否带域前缀："cn" / "global" / 空
+	// （空 = 不带前缀，走默认域 + 跨域回落）。仅在 AnthropicDefaultModel 非空时有意义。
+	AnthropicDefaultRealm string
+
+	// Requests 请求级可观测性记录器（可选；nil = 不埋点，零开销）。
+	// 只记录元数据，不含提示词/正文/凭证（见 internal/reqlog）。
+	Requests *reqlog.Recorder
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
@@ -152,7 +170,28 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 只对**模型调用**端点做请求级埋点。/panel/ 与 /healthz 是运维面，混进来只会
+	// 稀释「谁在打上游」这个信号；/v1/messages/count_tokens 是纯本地估算、不打上游，
+	// 同理排除。
+	if isModelEndpoint(r.URL.Path) {
+		h.withReqlog(h.mux).ServeHTTP(w, r)
+		return
+	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// isModelEndpoint 报告该路径是否是需要埋点的模型调用端点。
+func isModelEndpoint(path string) bool {
+	switch path {
+	case "/v1/chat/completions", "/v1/messages", "/v1/responses":
+		return true
+	}
+	return false
+}
+
+// reqlogRecorder 当前生效的记录器（nil = 未启用，埋点全部直通）。
+func (h *Handler) reqlogRecorder() *reqlog.Recorder {
+	return h.cfg.Requests
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {

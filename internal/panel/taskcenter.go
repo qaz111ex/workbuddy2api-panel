@@ -7,12 +7,17 @@
 //   - 执行队列（run_queue + queue）：把待办项按账号分组排队执行——账号内
 //     串行（复用 per-account 锁，与单任务/一键完成互斥），账号间并发
 //     （concurrency 信号量限制，默认 1）。队列状态可轮询。
+//   - 每日自动执行（RunGrowthQueueOnce）：scheduler 的 growth hook 到点调用，
+//     与手动「执行全部待办」共用同一条管线（先占位 → 扫描 → 队列），并发固定 1；
+//     Sequential 小程序任务族每日零点解锁一环，自动执行让任务链第二天继续推进，
+//     不必每天人工点一次。
 //
 // 开学季（school）任务侧已于 2026-09-24 活动结束后下线（面板不再有
 // /school/status 与 /school/run_all）；仅保留 /school/vouchers 券码查询。
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -156,7 +161,8 @@ func (p *Panel) queue() *queueState {
 
 // tasksRunQueue 启动执行队列：{concurrency:1-4, growth:bool}。
 // 先做一次扫描，把全部待办项排队（按账号内 autoActions 顺序执行），
-// 账号内串行、账号间受并发信号量约束。
+// 账号内串行、账号间受并发信号量约束。核心管线在 startGrowthQueue（与
+// scheduler 每日自动执行的 RunGrowthQueueOnce 共用）。
 func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Concurrency int  `json:"concurrency"`
@@ -172,6 +178,68 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	if body.Concurrency > 4 {
 		body.Concurrency = 4
 	}
+	// 刻意不用 r.Context()：执行队列是长任务（串联数环可达十几分钟），客户端关掉
+	// 面板/刷新页面不该把队列杀掉——这是引入队列以来的既有语义，保持不变。
+	res := p.startGrowthQueue(context.Background(), body.Concurrency)
+	if res.busy {
+		writeErr(w, http.StatusConflict, "队列正在执行中（可在任务中心查看进度）")
+		return
+	}
+	if !res.started {
+		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": "全部账号没有待办任务"})
+		return
+	}
+	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v）", res.total, body.Concurrency, body.Growth)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": res.total, "seq": res.seq})
+}
+
+// RunGrowthQueueOnce 成长任务队列的每日自动执行入口（scheduler 的 growth hook
+// 直接接线调用，见 scheduler.SetGrowthHook）。
+//
+// 与面板手动「执行全部待办」**完全同管线**：先占位防重入 → 扫描全部账号待办
+// （默认口径 + mp 小程序口径，仅 growthPending）→ 账号内串行、账号间并发 1 执行。
+// 唯一的差别是出口：本方法不写 HTTP 响应，结果只落日志。
+//
+// 安全跳过（不重复启动）：
+//   - 队列（手动触发或上一次自动触发）已在跑 → 命中先占位，直接返回；
+//   - 无待办 → 回滚占位后返回，q.seq 不动，不留任何「已启动」痕迹；
+//   - 陈旧占位（上次运行疑似挂死，超过 growthQueueStaleAfter）→ 复用既有兜底，
+//     放行本次（否则一次上游挂死会让每日自动执行永久失效）。
+//
+// ctx 为 scheduler 的生命周期 ctx：取消时扫描尽早放弃、已启动的队列在项间收尾
+// （占位由 runQueueItems 回滚），不会留一个永久 running 的假状态。
+func (p *Panel) RunGrowthQueueOnce(ctx context.Context) {
+	res := p.startGrowthQueue(ctx, 1)
+	switch {
+	case res.started:
+		log.Printf("scheduler: 成长任务队列自动执行已启动：%d 项（并发 1）", res.total)
+	case res.busy:
+		log.Printf("scheduler: 成长任务队列自动执行跳过：队列已在执行中")
+	case ctx.Err() != nil:
+		log.Printf("scheduler: 成长任务队列自动执行放弃：%v", ctx.Err())
+	default:
+		log.Printf("scheduler: 成长任务队列自动执行跳过：全部账号无待办")
+	}
+}
+
+// growthQueueRun startGrowthQueue 的一次尝试结果。
+type growthQueueRun struct {
+	started bool // 已真正启动执行队列
+	busy    bool // 队列正在执行（新鲜占位）→ 本次跳过，不重复启动
+	total   int  // 本次入队项数
+	seq     int  // 启动轮次（前端只渲染自己那一轮）
+}
+
+// startGrowthQueue 「执行全部待办」的核心管线：先占位 → 扫描待办 → 组装队列 →
+// 异步执行。手动 HTTP 入口（tasksRunQueue）与 scheduler 每日自动入口
+// （RunGrowthQueueOnce）共用，保证两条路径的队列状态机只有一份，不会旁路。
+//
+// concurrency 由调用方决定（手动 1-4，自动固定 1）；ctx 只用于「扫描前放弃 / 启动前
+// 放弃 / 执行期项间优雅停止」——上游 ListTasks/ListTasksMP 是无 ctx 超时的调用，
+// 已在飞行的扫描请求不会因取消而中断（与手动入口的限制相同）。
+func (p *Panel) startGrowthQueue(ctx context.Context, concurrency int) growthQueueRun {
+	var res growthQueueRun
 	q := p.queue()
 	q.mu.Lock()
 	if q.running {
@@ -186,19 +254,48 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		stale := !q.startedAt.IsZero() && time.Since(q.startedAt) > growthQueueStaleAfter
 		if !stale {
 			q.mu.Unlock()
-			writeErr(w, http.StatusConflict, "队列正在执行中（可在任务中心查看进度）")
-			return
+			return growthQueueRun{busy: true}
 		}
 		log.Printf("panel: 队列 running 标记已陈旧（开始于 %s，已过 %s），判定上次运行已死，放行本次启动",
 			q.startedAt.Format(time.RFC3339), time.Since(q.startedAt).Round(time.Second))
 	}
 	// 先占位：扫描（数秒级网络耗时）期间若并发再次触发，直接命中上面的 running
-	// 判拒，避免两个 goroutine 同时启动互相覆盖 q.items/q.seq。无待办时回滚。
+	// 判拒，避免两个 goroutine 同时启动互相覆盖 q.items/q.seq。无待办/放弃时回滚。
 	q.running = true
 	q.startedAt = time.Now()
 	q.mu.Unlock()
 
-	// 扫描待办（复用扫描逻辑的拉取部分）。
+	accts := p.scanGrowthQueue(ctx)
+
+	// 组装队列（账号分组，保持顺序）。
+	var items []queueItem
+	for _, one := range accts {
+		for _, t := range one.grow {
+			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode, Status: "pending"})
+		}
+	}
+	if len(items) == 0 || ctx.Err() != nil {
+		p.releaseQueuePlaceholder()
+		return res
+	}
+
+	q.mu.Lock()
+	q.items = items
+	q.conc = concurrency
+	q.seq++
+	seq := q.seq
+	q.mu.Unlock()
+	res.started, res.total, res.seq = true, len(items), seq
+
+	go p.runQueueItems(ctx, accts, items, concurrency)
+	return res
+}
+
+// scanGrowthQueue 扫描全部（未禁用、非 global）账号的成长待办：默认口径列表 +
+// mp 小程序口径列表（按 code 去重，mp 失败静默），仅保留 growthPending 项，
+// 并按 autoActions 顺序排序（依赖前置任务先执行）。与 tasksScanAll 同口径。
+// ctx 取消时不再启动新的账号扫描（已飞行的请求照常收尾）。
+func (p *Panel) scanGrowthQueue(ctx context.Context) []queueAccount {
 	states := p.cfg.Pool.List()
 	var accts []queueAccount
 	var wg sync.WaitGroup
@@ -214,36 +311,37 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(a *auth.Auth) {
 			defer wg.Done()
+			if ctx.Err() != nil {
+				return // 停机路径：不再发起新的上游扫描
+			}
 			one := queueAccount{a: a}
 			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
 				return
 			}
-			if body.Growth {
-				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
-					for _, t := range tasks {
-						if growthPending(t) {
+			if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+				for _, t := range tasks {
+					if growthPending(t) {
+						one.grow = append(one.grow, t)
+					}
+				}
+				// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
+				// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
+				// mp 待办而队列报"无可执行待办"。
+				if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+					seen := map[string]bool{}
+					for _, t := range one.grow {
+						seen[t.TaskCode] = true
+					}
+					for _, t := range mpTasks {
+						if growthPending(t) && !seen[t.TaskCode] {
 							one.grow = append(one.grow, t)
 						}
 					}
-					// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
-					// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
-					// mp 待办而队列报"无可执行待办"。
-					if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
-						seen := map[string]bool{}
-						for _, t := range one.grow {
-							seen[t.TaskCode] = true
-						}
-						for _, t := range mpTasks {
-							if growthPending(t) && !seen[t.TaskCode] {
-								one.grow = append(one.grow, t)
-							}
-						}
-					}
-					sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
-						return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
-					})
 				}
+				sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
+					return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
+				})
 			}
 			if len(one.grow) > 0 {
 				mu.Lock()
@@ -253,51 +351,34 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		}(a)
 	}
 	wg.Wait()
+	return accts
+}
 
-	// 组装队列（账号分组，保持顺序）。
-	var items []queueItem
-	for _, one := range accts {
-		for _, t := range one.grow {
-			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode, Status: "pending"})
-		}
-	}
-	if len(items) == 0 {
-		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
-		q.mu.Lock()
-		q.running = false
-		q.startedAt = time.Time{}
-		q.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": "全部账号没有待办任务"})
-		return
-	}
-
+// releaseQueuePlaceholder 回滚「先占位」（无待办 / 扫描期 ctx 取消）。
+func (p *Panel) releaseQueuePlaceholder() {
+	q := p.queue()
 	q.mu.Lock()
-	q.items = items
-	q.conc = body.Concurrency
-	q.seq++
-	seq := q.seq
+	q.running = false
+	q.startedAt = time.Time{} // 与启动处对称：清掉仓龄，避免残留时间戳误导陈旧判据
 	q.mu.Unlock()
-
-	go p.runQueueItems(accts, items, body.Concurrency)
-	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v）", len(items), body.Concurrency, body.Growth)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": len(items), "seq": seq})
 }
 
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），
 // 账号间并发（信号量）。每项结果写回队列状态。
-func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurrency int) {
+// ctx 取消时不再启动新账号、账号内在项间收尾（优雅停机不等限速睡满）。
+func (p *Panel) runQueueItems(ctx context.Context, accts []queueAccount, items []queueItem, concurrency int) {
 	q := p.queue()
 	defer func() {
-		q.mu.Lock()
-		q.running = false
-		q.startedAt = time.Time{} // 与启动处对称：清掉仓龄，避免残留时间戳误导陈旧判据
-		q.mu.Unlock()
+		p.releaseQueuePlaceholder()
 		log.Printf("panel: 队列执行结束（共 %d 项）", len(items))
 	}()
 
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for _, one := range accts {
+		if ctx.Err() != nil {
+			break // ctx 取消：不再启动新账号（已启动的账号在项间自行收尾）
+		}
 		wg.Add(1)
 		go func(one queueAccount) {
 			defer wg.Done()
@@ -318,6 +399,9 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 				time.Sleep(reportGap) // 给上游状态流转留时间
 			}
 			for i := range q.items {
+				if ctx.Err() != nil {
+					return // 优雅停机：剩余项下轮再执行
+				}
 				uid, kind, code := q.snapshotAt(i)
 				if uid != one.a.UID {
 					continue

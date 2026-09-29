@@ -29,6 +29,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -43,7 +44,10 @@ type Config struct {
 	APIKey    string               // 数据面（/v1/*）密钥；面板在 PanelKey 为空时回落复用它
 	// PanelKey 管理面（/panel/*）独立密钥。非空 = 面板只认它（数据面 api_key 打不开
 	// 面板）；空 = 回落复用 APIKey（历史行为）。与 APIKey 同时给出 Live 时 Live 优先。
-	PanelKey  string
+	PanelKey string
+	// Requests 请求级可观测性记录器（可选；nil = 对应接口返回 501）。
+	// 只含元数据：无提示词、无响应正文、无凭证。
+	Requests  *reqlog.Recorder
 	RedisMode string // "upstash" / "noop"，仅观测透出
 	Version   string // 面板版本号（展示用）
 
@@ -155,6 +159,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	// 请求级可观测性（元数据快照：成功率/耗时/最近请求）。Requests 为 nil → 501。
+	p.mux.HandleFunc("GET /panel/api/requests", p.withAuth(p.requestsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
@@ -244,6 +250,31 @@ func (p *Panel) panelKey() string {
 // ---------------------------------------------------------------------------
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
+// requestsHandler 请求级可观测性快照。
+//
+// 只回元数据（请求 id / 路径 / 账号标签 / 模型 / 状态 / 耗时 / 重试次数 / token 计数 /
+// 扣费），**不含提示词、响应正文、Authorization 或任何凭证** —— 这是 reqlog.Event
+// 的结构决定的（字段根本不存在），不是靠这里过滤。
+//
+// 为什么 nil 回 501 而不是空对象：501 与「真的没有请求」是两件事，前者是「本进程
+// 没启用记录器」，回 501 才能让面板区分并如实显示。
+func (p *Panel) requestsHandler(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Requests == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": "请求记录未启用"})
+		return
+	}
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 100 {
+		limit = 100 // 与 reqlog 内部 Recent 上界一致
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Requests.Snapshot(limit))
+}
+
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
 	sticky := 0

@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1153,5 +1155,293 @@ func TestMessagesNonStreamToolCallsWithoutFinishReason(t *testing.T) {
 	}
 	if len(resp["content"].([]any)) != 1 {
 		t.Fatalf("content=%v", resp["content"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// anthropic.default_model 兜底替换（原生 Anthropic 模型名自动落到网关目录模型）
+// ---------------------------------------------------------------------------
+
+// withColdModelsCache 清空 CN 目录缓存（模拟冷启动：从未拉过 /v1/models）。
+// cachedModelsSnapshot 在冷缓存 / 空缓存下返回 nil → 目录判定视为「未命中」。
+func withColdModelsCache(t *testing.T) {
+	t.Helper()
+	dynamicModelsCache.Lock()
+	oldIDs, oldFetched, oldFail := dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail
+	dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail = nil, time.Time{}, time.Time{}
+	dynamicModelsCache.Unlock()
+	t.Cleanup(func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids, dynamicModelsCache.fetched, dynamicModelsCache.lastFail = oldIDs, oldFetched, oldFail
+		dynamicModelsCache.Unlock()
+	})
+}
+
+// gatewayModelFields 取响应/message 对象上的 gateway_model_* 扩展字段。未发生替换时
+// 必须为空 map（= 一个字段都不加，响应形状与改造前逐字一致）。
+func gatewayModelFields(obj map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range obj {
+		if strings.HasPrefix(k, "gateway_model_") {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// decodeCompatJSON 解析非流式响应体。
+func decodeCompatJSON(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("响应不是 JSON: %v body=%s", err, rec.Body)
+	}
+	return resp
+}
+
+// TestSubstituteAnthropicModelRules 纯函数规则表：命中目录 / 未命中 + 默认模型
+// （realm 三种）/ 未配置 / 显式 cn:/global: 前缀 / 非法 realm。
+func TestSubstituteAnthropicModelRules(t *testing.T) {
+	withCNCatalog(t, "glm-5.2", "deepseek-v4.1-flash")
+	cases := []struct {
+		name    string
+		req     string
+		def     string
+		realm   string
+		want    string
+		wantSub bool
+	}{
+		{"命中目录不替换", "glm-5.2", "deepseek-v4.1-flash", "", "glm-5.2", false},
+		{"命中目录不替换(带 realm 前缀配置)", "deepseek-v4.1-flash", "glm-5.2", "cn", "deepseek-v4.1-flash", false},
+		{"未命中+默认(无前缀)", "claude-sonnet-4-20250514", "glm-5.2", "", "glm-5.2", true},
+		{"未命中+默认(cn 前缀)", "claude-sonnet-4-20250514", "glm-5.2", "cn", "cn:glm-5.2", true},
+		{"未命中+默认(global 前缀)", "claude-sonnet-4-20250514", "deepseek-v4.1-flash", "global", "global:deepseek-v4.1-flash", true},
+		{"未配置默认不动", "claude-sonnet-4-20250514", "", "", "claude-sonnet-4-20250514", false},
+		{"未配置默认不动(有 realm)", "claude-sonnet-4-20250514", "", "cn", "claude-sonnet-4-20250514", false},
+		{"cn 前缀原样", "cn:claude-sonnet-4-20250514", "glm-5.2", "", "cn:claude-sonnet-4-20250514", false},
+		{"global 前缀原样", "global:claude-sonnet-4-20250514", "glm-5.2", "cn", "global:claude-sonnet-4-20250514", false},
+		{"前缀+命中目录仍原样", "cn:glm-5.2", "deepseek-v4.1-flash", "", "cn:glm-5.2", false},
+		{"非法 realm 退化为裸名", "claude-sonnet-4-20250514", "glm-5.2", "weird", "glm-5.2", true},
+		{"realm 大小写与空白宽容", "claude-sonnet-4-20250514", "glm-5.2", " CN ", "cn:glm-5.2", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, sub := substituteAnthropicModel(c.req, c.def, c.realm)
+			if got != c.want || sub != c.wantSub {
+				t.Errorf("substituteAnthropicModel(%q, %q, %q) = (%q, %v), want (%q, %v)",
+					c.req, c.def, c.realm, got, sub, c.want, c.wantSub)
+			}
+		})
+	}
+}
+
+// TestSubstituteAnthropicModelColdCatalog 目录缓存冷（从未拉取）→ 视为未命中，按
+// 契约替换为默认模型。纯函数没有任何网络能力，此断言同时把「判定不拉上游」钉在
+// 纯函数层面。
+func TestSubstituteAnthropicModelColdCatalog(t *testing.T) {
+	withColdModelsCache(t)
+	got, sub := substituteAnthropicModel("glm-5.2", "deepseek-v4.1-flash", "global")
+	if got != "global:deepseek-v4.1-flash" || !sub {
+		t.Errorf("冷目录: got (%q, %v), want (global:deepseek-v4.1-flash, true)", got, sub)
+	}
+}
+
+// TestMessagesDefaultModelSubstitutedNonStream 非流式端到端：原生 Anthropic 模型名
+// 未命中目录 → 出站换成 anthropic.default_model，响应仍回显原名，替换事实经
+// gateway_model_* 三字段如实标注，并落一行 INFO 日志（绝不静默改写）。
+func TestMessagesDefaultModelSubstitutedNonStream(t *testing.T) {
+	withColdModelsCache(t)
+	up, cu := newCompatUpstream(t, func(string, map[string]any) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{
+		Pool:                  testPoolWith(cnAuth("c1")),
+		Upstream:              up,
+		AnthropicDefaultModel: "glm-5.2",
+		AnthropicDefaultRealm: "cn",
+	})
+
+	var logs strings.Builder
+	oldOut := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldOut)
+
+	rec := postCompat(t, h, "/v1/messages",
+		`{"model":"claude-sonnet-4-20250514","max_tokens":8,"messages":[{"role":"user","content":"q"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	resp := decodeCompatJSON(t, rec)
+	if resp["model"] != "claude-sonnet-4-20250514" {
+		t.Errorf("响应 model=%v want 客户端原始名（协议语义：响应 model = 请求 model）", resp["model"])
+	}
+	if resp[anthropicSubstitutedField] != true {
+		t.Errorf("%s=%v want true", anthropicSubstitutedField, resp[anthropicSubstitutedField])
+	}
+	// 契约硬要求：requested 是**客户端原始名**，不是替换后的名。
+	if resp[anthropicRequestedField] != "claude-sonnet-4-20250514" {
+		t.Errorf("%s=%v want 客户端原始名", anthropicRequestedField, resp[anthropicRequestedField])
+	}
+	if resp[anthropicEffectiveField] != "cn:glm-5.2" {
+		t.Errorf("%s=%v want cn:glm-5.2", anthropicEffectiveField, resp[anthropicEffectiveField])
+	}
+	// 出站：realm 前缀由既有 rewriteModel 剥离，上游收到裸模型名。
+	if got := cu.last(t)["model"]; got != "glm-5.2" {
+		t.Errorf("出站 model=%v want glm-5.2", got)
+	}
+	// 目录判定只读快照：整条请求的上游调用有且仅有 chat 一次。
+	if n := cu.count(); n != 1 {
+		t.Errorf("上游调用数=%d want 1（模型目录判定不得触发上游拉取）", n)
+	}
+	if s := logs.String(); !strings.Contains(s, "claude-sonnet-4-20250514") || !strings.Contains(s, "cn:glm-5.2") {
+		t.Errorf("缺少替换 INFO 日志（须含原名 → 新名）: %q", s)
+	}
+}
+
+// TestMessagesDefaultModelSubstitutedStream 流式端到端：替换事实带在
+// message_start.message 上（与非流式同口径），且不触发模型目录拉取。
+func TestMessagesDefaultModelSubstitutedStream(t *testing.T) {
+	withColdModelsCache(t)
+	up, cu := newCompatUpstream(t, func(string, map[string]any) (int, string, bool) {
+		return 200, anthropicStreamBody, true
+	})
+	h := NewHandler(Config{
+		Pool:                  testPoolWith(cnAuth("c1")),
+		Upstream:              up,
+		AnthropicDefaultModel: "deepseek-v4.1-flash",
+		AnthropicDefaultRealm: "global",
+	})
+	rec := postCompat(t, h, "/v1/messages",
+		`{"model":"claude-sonnet-4-20250514","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"q"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	start := findEvent(parseCompatSSE(t, rec.Body.String()), "message_start")
+	if start == nil {
+		t.Fatalf("缺 message_start: %s", rec.Body)
+	}
+	msg, _ := start.data["message"].(map[string]any)
+	if msg == nil {
+		t.Fatalf("message_start 缺 message 对象: %v", start.data)
+	}
+	if msg["model"] != "claude-sonnet-4-20250514" {
+		t.Errorf("message_start.message.model=%v want 客户端原始名", msg["model"])
+	}
+	if msg[anthropicSubstitutedField] != true ||
+		msg[anthropicRequestedField] != "claude-sonnet-4-20250514" ||
+		msg[anthropicEffectiveField] != "global:deepseek-v4.1-flash" {
+		t.Errorf("message_start.message 未如实标注替换事实: %v", gatewayModelFields(msg))
+	}
+	if got := cu.last(t)["model"]; got != "deepseek-v4.1-flash" {
+		t.Errorf("出站 model=%v want deepseek-v4.1-flash", got)
+	}
+	if n := cu.count(); n != 1 {
+		t.Errorf("上游调用数=%d want 1（模型目录判定不得触发上游拉取）", n)
+	}
+}
+
+// TestMessagesNoDefaultModelSubstitution 不该替换的四类情形（非流式 + 流式）：
+// 命中目录 / 显式 cn: 前缀 / 显式 global: 前缀 / 未配置默认模型。四者都必须
+// **原样透传**用户指定的模型名，且响应上一个 gateway_model_* 字段都不能出现。
+func TestMessagesNoDefaultModelSubstitution(t *testing.T) {
+	withCNCatalog(t, "glm-5.2")
+	cases := []struct {
+		name    string
+		def     string
+		realm   string
+		model   string
+		stream  bool
+		wantOut string // 上游实际收到的裸模型名
+	}{
+		{"命中目录不替换", "deepseek-v4.1-flash", "cn", "glm-5.2", false, "glm-5.2"},
+		{"命中目录不替换(流式)", "deepseek-v4.1-flash", "cn", "glm-5.2", true, "glm-5.2"},
+		{"cn 前缀不替换", "glm-5.2", "cn", "cn:claude-sonnet-4-20250514", false, "claude-sonnet-4-20250514"},
+		{"cn 前缀不替换(流式)", "glm-5.2", "", "cn:claude-sonnet-4-20250514", true, "claude-sonnet-4-20250514"},
+		{"global 前缀不替换", "glm-5.2", "global", "global:claude-sonnet-4-20250514", false, "claude-sonnet-4-20250514"},
+		{"未配置不替换", "", "", "claude-sonnet-4-20250514", false, "claude-sonnet-4-20250514"},
+		{"未配置不替换(流式)", "", "cn", "claude-sonnet-4-20250514", true, "claude-sonnet-4-20250514"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body, isStream := sseOK, false
+			if c.stream {
+				body, isStream = anthropicStreamBody, true
+			}
+			up, cu := newCompatUpstream(t, func(string, map[string]any) (int, string, bool) {
+				return 200, body, isStream
+			})
+			h := NewHandler(Config{
+				Pool:                  testPoolWith(cnAuth("c1")),
+				Upstream:              up,
+				AnthropicDefaultModel: c.def,
+				AnthropicDefaultRealm: c.realm,
+			})
+			payload := fmt.Sprintf(
+				`{"model":%q,"max_tokens":8,"stream":%v,"messages":[{"role":"user","content":"q"}]}`,
+				c.model, c.stream)
+			rec := postCompat(t, h, "/v1/messages", payload)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			var obj map[string]any
+			if c.stream {
+				start := findEvent(parseCompatSSE(t, rec.Body.String()), "message_start")
+				if start == nil {
+					t.Fatalf("缺 message_start: %s", rec.Body)
+				}
+				obj, _ = start.data["message"].(map[string]any)
+			} else {
+				obj = decodeCompatJSON(t, rec)
+			}
+			if obj == nil {
+				t.Fatal("无法取出 message 对象")
+			}
+			if obj["model"] != c.model {
+				t.Errorf("响应 model=%v want %q（原样回显客户端模型名）", obj["model"], c.model)
+			}
+			if got := gatewayModelFields(obj); len(got) != 0 {
+				t.Errorf("未发生替换时不得出现任何 gateway_model_* 字段: %v", got)
+			}
+			if got := cu.last(t)["model"]; got != c.wantOut {
+				t.Errorf("出站 model=%v want %v（用户显式指定的模型不得被改写）", got, c.wantOut)
+			}
+			if n := cu.count(); n != 1 {
+				t.Errorf("上游调用数=%d want 1（目录判定不得触发上游拉取）", n)
+			}
+		})
+	}
+}
+
+// TestMessagesUnconfiguredResponseShapeUnchanged 未配置 anthropic.default_model 时
+// 响应形状与改造前**逐字一致**：恰好这 8 个键（一个都不多），且模型名原样透传。
+func TestMessagesUnconfiguredResponseShapeUnchanged(t *testing.T) {
+	withColdModelsCache(t)
+	up, cu := newCompatUpstream(t, func(string, map[string]any) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: testPoolWith(cnAuth("c1")), Upstream: up})
+	rec := postCompat(t, h, "/v1/messages",
+		`{"model":"claude-sonnet-4-20250514","max_tokens":8,"messages":[{"role":"user","content":"q"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	resp := decodeCompatJSON(t, rec)
+	want := []string{"id", "type", "role", "model", "content", "stop_reason", "stop_sequence", "usage"}
+	if len(resp) != len(want) {
+		t.Errorf("响应键数=%d want %d（未配置时不得新增任何字段）: %v", len(resp), len(want), resp)
+	}
+	for _, k := range want {
+		if _, ok := resp[k]; !ok {
+			t.Errorf("缺键 %q（Anthropic 形态）: %v", k, resp)
+		}
+	}
+	if got := gatewayModelFields(resp); len(got) != 0 {
+		t.Errorf("未配置时不得出现 gateway_model_* 字段: %v", got)
+	}
+	if got := cu.last(t)["model"]; got != "claude-sonnet-4-20250514" {
+		t.Errorf("未配置时模型名必须原样透传: %v", got)
+	}
+	if n := cu.count(); n != 1 {
+		t.Errorf("上游调用数=%d want 1", n)
 	}
 }

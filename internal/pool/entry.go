@@ -61,16 +61,26 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
-	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	UID          string `json:"uid"`
+	Nickname     string `json:"nickname,omitempty"`
+	Credits      int64  `json:"credits"`
+	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 到期压力台账：
+	// 窗内快过期量 + 最早未来到期批次（时刻与批次剩余量）。运维据此自查「最早到期优先
+	// 路由为什么选了它 / 当前快照是否采集到到期时间」。零值省略 → 未启用或无快照时
+	// 完全保持既有 /status JSON 形状（零回归）。
+	// CreditsEarliestExpiry 用 *time.Time 而非 time.Time：Go 的 omitempty 对非指针
+	// time.Time 零值不生效（会恒定序列化出 "0001-01-01T00:00:00Z"），指针 nil 才能真正
+	// 省略——与 stateAccount.BreakerUntil/DegradeUntil 同一取舍。
+	CreditsExpiring          int64      `json:"credits_expiring,omitempty"`
+	CreditsEarliestExpiry    *time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestRemaining int64      `json:"credits_earliest_remaining,omitempty"`
+	Cooling                  bool       `json:"cooling"`
+	CoolKind                 string     `json:"cool_kind,omitempty"`
+	CoolRemaining            int64      `json:"cool_remaining_sec,omitempty"`
+	Until                    time.Time  `json:"until,omitempty"`
+	Reason                   string     `json:"reason,omitempty"`
+	SoftStreak               int        `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
@@ -171,13 +181,22 @@ type entry struct {
 	// creditsExpiring 即将过期（签到时按 expiring_soon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废。
-	// 运行态，签到/余额刷新时更新，不单独持久化（credits 仍持总量）。
+	// 运行态，签到/余额刷新时更新，并随 state.json 持久化（见 stateAccount.CreditsExpiring）。
 	creditsExpiring int64
-	successCount    int64      // 累计成功
-	errTotal        int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr         time.Time  // 最近一次错误时间
-	lastSuccess     time.Time  // 最近一次成功时间
-	tokenUsage      TokenUsage // 聊天请求 token 用量摘要（持久化）
+	// creditsEarliestExpiry / creditsEarliestRemaining 是**全部未来到期批次**中最早的
+	// 一批及其该批剩余积分（同到期时刻的多个包合并为一批）。与 creditsExpiring 的
+	// 口径差异：creditsExpiring 是「配置窗口内（expiring_soon）的到期量」，随窗口变化；
+	// 本对字段与窗口无关，永远是最近的那个未来到期时刻——最早到期优先路由
+	// （pick 在成本最优层内按到期升序）据此排序。
+	// 零值（IsZero / 0）表示「无有效到期时间」，此类账号不进优先集。
+	// 运行态，签到/余额刷新时由 SetCreditsDetailedWithExpiry 更新，随 state.json 持久化。
+	creditsEarliestExpiry    time.Time
+	creditsEarliestRemaining int64
+	successCount             int64      // 累计成功
+	errTotal                 int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr                  time.Time  // 最近一次错误时间
+	lastSuccess              time.Time  // 最近一次成功时间
+	tokenUsage               TokenUsage // 聊天请求 token 用量摘要（持久化）
 	// lastCheckinDay 最近一次「已签到」的本地日期（"2006-01-02"）。签到成功与上游
 	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 Status.CheckinDone 供面板按钮
 	// 显示 签到/已签。持久化（stateAccount.LastCheckinDay）：跨重启不丢当日状态。
@@ -437,6 +456,13 @@ type stateAccount struct {
 	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留第四因子
 	// （weightOf 快过期积分加成）的偏好——重启后到下次签到之间不应失忆。
 	CreditsExpiring int64 `json:"credits_expiring"`
+	// CreditsEarliestExpiry / CreditsEarliestRemaining 最早未来到期批次及该批次剩余量，
+	// 与 CreditsExpiring 一并持久化：重启后到下次余额刷新之间仍可沿用最近一次快照做
+	// 最早到期优先路由。恢复侧惰性清洗（已过期/零剩余/超总余额的脏数据不恢复）。
+	// CreditsEarliestExpiry 用 *time.Time：nil 才能被 omitempty 真正省略（口径同
+	// BreakerUntil/DegradeUntil「无效不落盘」，也避免零值 0001-01-01 污染 state.json）。
+	CreditsEarliestExpiry    *time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestRemaining int64      `json:"credits_earliest_remaining,omitempty"`
 	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 / 11102
 	// 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。

@@ -116,6 +116,13 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 			e.credits = remain
 			e.creditsTotal = total
 		}
+		// 本入口只有聚合余额上下文（无到期明细）：清空最早到期批次快照，避免拿
+		// 「权威余额已变、到期明细未更新」的旧快照参与最早到期优先路由。紧随其后的
+		// SetCreditsDetailedWithExpiry（带采集明细）会重建；未重建＝无窗内到期批次。
+		// 注意：creditsExpiring 不在此清（本 fork 的既有口径，见 transition.go 注释），
+		// 只清本任务新增的最早批次对，避免改变既有 ×8 权重行为。
+		e.creditsEarliestExpiry = time.Time{}
+		e.creditsEarliestRemaining = 0
 		p.dirty.Store(true)
 	}
 }
@@ -221,6 +228,25 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		}
 		if e.creditsExpiring < 0 {
 			e.creditsExpiring = 0
+		}
+		// 最早到期批次同样**独立**扣减（口径同 creditsExpiring：独立变量 + 显式钳 0；
+		// 不复用会被前一级改小的 d，否则该桶被少扣）。批次打空即清到期时刻——零剩余
+		// 批次不再是有效批次，不得继续参与最早到期优先集。
+		if e.creditsEarliestRemaining > 0 {
+			dEarliest := d
+			if dEarliest > e.creditsEarliestRemaining {
+				dEarliest = e.creditsEarliestRemaining
+			}
+			e.creditsEarliestRemaining -= dEarliest
+		}
+		if e.creditsEarliestRemaining > e.credits {
+			e.creditsEarliestRemaining = e.credits
+		}
+		if e.creditsEarliestRemaining < 0 {
+			e.creditsEarliestRemaining = 0
+		}
+		if e.creditsEarliestRemaining == 0 {
+			e.creditsEarliestExpiry = time.Time{}
 		}
 	}
 	if e.modelCost == nil {
@@ -500,27 +526,37 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
-		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:            e.reason,
-		Disabled:          e.disabled,
-		SuccessCount:      e.successCount,
-		ErrTotal:          e.errTotal,
-		CheckinDone:       e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:        e.tokenUsage,
-		LastSuccessTime:   e.lastSuccess,
-		LastErrTime:       e.lastErr,
-		Until:             e.until,
-		SoftStreak:        e.softStreak,
-		ModelCosts:        p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:  e.consecutiveFails,
-		DegradeUntil:      e.degradeUntil,
-		InFlight:          int(e.inFlight.Load()),
-		BreakerFails:      e.fails,
-		BreakerUntil:      e.breakerUntil,
+		// 到期压力台账（最早到期优先路由的可观测性）：运维据此自查「为什么选了它 /
+		// 采集侧到底有没有拿到到期时间」。零值省略 → 未启用/无快照时 JSON 形状不变。
+		CreditsExpiring:          e.creditsExpiring,
+		CreditsEarliestRemaining: e.creditsEarliestRemaining,
+		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
+		Reason:                   e.reason,
+		Disabled:                 e.disabled,
+		SuccessCount:             e.successCount,
+		ErrTotal:                 e.errTotal,
+		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:               e.tokenUsage,
+		LastSuccessTime:          e.lastSuccess,
+		LastErrTime:              e.lastErr,
+		Until:                    e.until,
+		SoftStreak:               e.softStreak,
+		ModelCosts:               p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails:         e.consecutiveFails,
+		DegradeUntil:             e.degradeUntil,
+		InFlight:                 int(e.inFlight.Load()),
+		BreakerFails:             e.fails,
+		BreakerUntil:             e.breakerUntil,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason
+	}
+	// 最早未来到期批次：仅有效（非零）时置指针，nil 才能被 omitempty 省略
+	// （非指针 time.Time 的零值会恒定序列化成 0001-01-01T00:00:00Z）。
+	if !e.creditsEarliestExpiry.IsZero() {
+		at := e.creditsEarliestExpiry
+		st.CreditsEarliestExpiry = &at
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。

@@ -1928,6 +1928,20 @@ func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 // 与 softRateResetLoc 同口径）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
+// parsePackageEndTime 统一解析上游套餐到期时间（CycleEndTime）。空值、格式异常返回
+// false，调用方据此保守地把该包排除在「最早到期批次」与「快过期分桶」之外——解析不出
+// 到期时刻的包不该被当成快过期而插队。
+func parsePackageEndTime(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	t, err := time.ParseInLocation(packageEndLayout, raw, softRateResetLoc)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
 // soon > 0 且套餐到期时间（CycleEndTime）解析成功且到期时刻 ≤ now+soon 的余额计入
 // expiring（pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时
@@ -1938,6 +1952,22 @@ const packageEndLayout = "2006-01-02 15:04:05"
 // 时刻（global Bonus Pack 14 天赠送积分的到期时间即此字段）。解析失败/缺失的套餐
 // 保守归入 Stable（不误标为快过期而插队）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+	// 兼容入口：旧签名原样保留（scheduler 等调用方不受影响），实现委托给带到期批次的版本。
+	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+	return remain, total, expiring, err
+}
+
+// UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上额外返回「最早未来到期
+// 批次」：earliestAt 是所有「正余额且到期时刻在未来」的套餐中最早的到期时刻；
+// earliestRemaining 是同一到期时刻的所有正余额套餐剩余量之和（同批次合并）。
+//
+// 已过期、零余额、缺 CycleEndTime 或解析失败的套餐都不构成最早批次；无有效批次时
+// 返回零值（pool 据此判定「无有效到期时间」而不进优先集）。
+//
+// 口径边界：soon 只影响 expiring 分桶（窗口内快过期量），**不影响**最早批次——最早
+// 批次是「全部未来批次」口径，这样才能区分「窗内最早」与「窗外最早」。复用同一份
+// 响应体，**零新增上游请求**。
+func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1957,7 +1987,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		return e
 	})
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, time.Time{}, 0, err
 	}
 	var resp struct {
 		Response struct {
@@ -1976,7 +2006,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		// 单套餐取数统一到 packageRemainUsed（与 ResourceSummary/cmd/credit 同一事实来源，
@@ -2002,16 +2032,26 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		}
 		remain += r
 		total += size
-		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.CycleEndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.CycleEndTime, softRateResetLoc); perr == nil {
-				if !end.After(now.Add(soon)) {
-					expiring += r
-				}
+		end, ok := parsePackageEndTime(acct.CycleEndTime)
+		if !ok {
+			continue // 无有效到期时间：不构成最早批次，也不计入快过期分桶（与引入前口径一致）
+		}
+		// 最早未来到期批次：仅「正余额且到期时刻在未来」的包参与（已过期批次不进优先集）；
+		// 同到期时刻的多个包合并剩余量（视为同一批次）。
+		if r > 0 && end.After(now) {
+			if earliestAt.IsZero() || end.Before(earliestAt) {
+				earliestAt = end
+				earliestRemaining = r
+			} else if end.Equal(earliestAt) {
+				earliestRemaining += r
 			}
 		}
+		// 分桶：仅 soon>0 且确实在窗口内 → expiring（判据与引入前逐字一致）。
+		if soon > 0 && r > 0 && !end.After(now.Add(soon)) {
+			expiring += r
+		}
 	}
-	return remain, total, expiring, nil
+	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }
 
 // respAccount 单套餐的六个容量字段（get-user-resource 响应条目）。

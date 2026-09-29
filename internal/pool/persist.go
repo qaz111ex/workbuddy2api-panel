@@ -165,6 +165,21 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			softStreak:       s.SoftStreak,
 			sessionDeadFails: s.SessionDeadFails,
 			consecutiveFails: s.ConsecutiveFails,
+			// 最早未来到期批次：先原样恢复，下方按当前时刻惰性清洗（脏数据/过期不复活）。
+			creditsEarliestRemaining: s.CreditsEarliestRemaining,
+		}
+		if s.CreditsEarliestExpiry != nil {
+			e.creditsEarliestExpiry = *s.CreditsEarliestExpiry
+		}
+		// 最早到期批次快照惰性清洗：负值/超总余额的脏数据（手工编辑 state.json）与
+		// 「已过期 / 零剩余 / 无到期时刻」一律归零——否则重启后会拿一个早就过期或
+		// 剩余量虚高的批次参与最早到期优先路由（路由判据见 pickEarliestCreditExpiryLocked）。
+		if e.creditsEarliestRemaining < 0 || e.creditsEarliestRemaining > s.Credits {
+			e.creditsEarliestRemaining = 0
+		}
+		if e.creditsEarliestRemaining == 0 || e.creditsEarliestExpiry.IsZero() || !now.Before(e.creditsEarliestExpiry) {
+			e.creditsEarliestExpiry = time.Time{}
+			e.creditsEarliestRemaining = 0
 		}
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
@@ -274,6 +289,9 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
+		// 最早未来到期批次：只在「未过期且仍有剩余」时落盘（与恢复侧惰性清洗同口径，
+		// 避免已过期/空的批次快照在 state.json 里长期残留）。
+		earliestAt, earliestRemaining := earliestSnapshotToPersist(e, now)
 		s := stateAccount{
 			Credits:          e.credits,
 			CreditsTotal:     e.creditsTotal,
@@ -291,6 +309,9 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			SessionDeadFails: e.sessionDeadFails,
 			ConsecutiveFails: e.consecutiveFails,
 			CreditsExpiring:  e.creditsExpiring,
+			// 最早未来到期批次（时刻 + 该批次剩余量）。
+			CreditsEarliestExpiry:    earliestAt,
+			CreditsEarliestRemaining: earliestRemaining,
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
@@ -342,4 +363,18 @@ func clampExpiring(expiring, credits int64) int64 {
 		return credits
 	}
 	return expiring
+}
+
+// earliestSnapshotToPersist 返回可落盘的最早未来到期批次（时刻指针 + 该批次剩余量）。
+// 只在「仍有剩余且到期时刻仍在未来」时返回非 nil 指针，其余返回 nil/0——nil 才能被
+// omitempty 真正省略（口径同 BreakerUntil/DegradeUntil），也避免已过期/空的批次快照
+// 随 state.json 长期残留。恢复侧有对称的惰性清洗。
+func earliestSnapshotToPersist(e *entry, now time.Time) (*time.Time, int64) {
+	if e.creditsEarliestRemaining > 0 &&
+		!e.creditsEarliestExpiry.IsZero() &&
+		now.Before(e.creditsEarliestExpiry) {
+		at := e.creditsEarliestExpiry
+		return &at, e.creditsEarliestRemaining
+	}
+	return nil, 0
 }

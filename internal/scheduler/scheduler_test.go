@@ -66,6 +66,9 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		TravelDisabled:   true,
 		ActivityDisabled: true,
 		BlackcatDisabled: true,
+		// 成长任务默认 01:00 是「签到之后最近的一族」，不禁用会抢走 22:30 之后的
+		// 最近时点（次日 01:00 早于次日 09:00），干扰本用例的签到断言。
+		GrowthDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -120,7 +123,7 @@ func TestNextWakeKeepaliveDisabled(t *testing.T) {
 	}
 }
 
-// TestNextWakeBothDisabledNothingScheduled 五类任务都显式禁用 → 无可唤醒时点。
+// TestNextWakeBothDisabledNothingScheduled 全部任务族都显式禁用 → 无可唤醒时点。
 func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	s := New(Config{
 		CheckinDisabled:   true,
@@ -128,6 +131,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
 		BlackcatDisabled:  true,
+		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 	})
@@ -137,7 +141,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 	}
 }
 
-// TestRunAllDisabledNoSpinNoCalls 四类任务全禁用：Run 不空转（只等退出信号），
+// TestRunAllDisabledNoSpinNoCalls 任务族全禁用：Run 不空转（只等退出信号），
 // 且不能触发任何上游请求。
 func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 	var calls atomic.Int32
@@ -161,6 +165,10 @@ func TestRunAllDisabledNoSpinNoCalls(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
+		// 夜猫子/成长默认时点（23:00 / 01:00）也一并禁用：本用例断言「没有任何
+		// 上游请求」，时点是否恰好落在 250ms 窗口内不该决定用例结果。
+		BlackcatDisabled: true,
+		GrowthDisabled:   true,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)

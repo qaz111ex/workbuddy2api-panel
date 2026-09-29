@@ -160,7 +160,7 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4.1-flash"
 
 ### 已知限制（如实列出，避免踩坑）
 
-- **Anthropic 原生模型名（`claude-*`）不会自动替换**：必须按上面的方式把模型名设成网关目录里的模型。自动替换需要 `anthropic.default_model` 配置项（尚未提供）。
+- **Anthropic 原生模型名（`claude-*`）需要配 `anthropic.default_model`**：Claude Code 默认发 `claude-sonnet-4-*` 这类名字，网关目录里没有 → 直接失败。两种解法：① 按上面的环境变量把模型名设成网关目录内的模型；② **推荐**——配置里设 `"anthropic": {"default_model": "deepseek-v4.1-flash"}`（面板「服务」配置页也有），网关会把**未命中目录**的模型名自动替换成它，**开箱即用**。替换有边界：命中网关目录的名字、或带 `cn:`/`global:` 前缀的名字**一律不动**（绝不改掉你显式指定的模型）；替换发生时响应会带 `gateway_model_substituted` / `gateway_model_requested` / `gateway_model_effective` 三个字段并打一行日志——**不偷偷改**。该配置需重启生效。
 - **`count_tokens` 是估算**（ASCII/4 + 非 ASCII×1 + 每条消息 4），不是上游计费口径，仅供客户端做数量级提示。
 - **thinking / redacted_thinking 内容块不回传**：Anthropic 的 thinking 块必须带 `signature`，网关无法合成（伪造会被严格客户端拒绝）。请求侧的 thinking 预算会映射成 reasoning effort。
 - **未支持**：Anthropic 的 `document`(PDF) 块、服务端工具（`web_search_*`）、`top_k`；Responses 的 `previous_response_id`/`store`/`include`/结构化输出 `text.format`。这些在上游 chat 协议里没有等价物，代码中有显式分支，**不会静默丢弃**。
@@ -383,6 +383,13 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `panel_key` | 空 | **管理面**（`/panel/*`）独立鉴权密钥。非空 = 面板**只**认它，数据面 `api_key` 打不开面板；空 = 回落复用 `api_key`（向后兼容，启动日志会告警）。**强烈建议设置**：见下方[为什么建议分离](#为什么建议把面板密钥独立出来) |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
+| `anthropic.default_model` | 空（关闭） | **Anthropic 兜底模型**：`/v1/messages` 收到未命中网关目录的模型名（如 `claude-sonnet-4-*`）时替换成它。空 = 不做任何隐式替换。替换事实会在响应字段与日志中标注。**需重启生效** |
+| `anthropic.default_realm` | 空 | 替换出的模型名是否带域前缀（`cn` / `global` / 空 = 不带，走默认域 + 跨域回落） |
+| `logging.request_archive_enabled` | `true` | **请求元数据归档**（JSONL，按天切分）：请求 id / 路径 / 账号标签 / 模型 / 状态 / 耗时 / 首字节 / 重试次数 / token 计数 / 扣费。**绝不含提示词、响应正文、Authorization 或任何凭证**（由 `reqlog.Event` 的字段缺失在类型层面保证）。面板 `GET /panel/api/requests` 提供指标快照 |
+| `logging.request_retention_days` | `7` | 归档保留天数（同时保留含今天在内共 N 天） |
+| `logging.request_archive_max_mb` | `100` | 归档总容量上限 MiB，超限优先删最旧（永不动正在写的文件） |
+| `schedule.growth_hours` | `[1]` | 成长任务队列每日自动执行时点。**默认 1 点**（避开 Sequential 链 0 点解锁的竞态） |
+| `schedule.growth_enabled` | `true` | 关闭后仍可在面板手动「执行全部待办」 |
 | `shutdown_grace_seconds` | `5` | 收到 SIGINT/SIGTERM 后等待**在途请求自然结束**的上限秒数。★ 网关以**长流式 SSE** 为主负载，一次生成合法可达数分钟；默认 5s 会掐断大多数在途流，想真正保住就调大（如 `120`）。调大的代价是停机变慢（最坏等满该值）。`<=0` 回落 5 |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |

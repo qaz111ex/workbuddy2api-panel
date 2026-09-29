@@ -43,21 +43,56 @@ func (p *Pool) NoteCheckinDone(uid string) {
 // SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
 // 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
 // 不污染权重。
+//
+// 兼容入口：本签名不带到期时间明细，故委托时以零值传入，**同时清空**最早未来到期
+// 批次快照（见 SetCreditsDetailedWithExpiry）——没有到期明细就不该沿用旧批次做
+// 最早到期路由。带采集明细的生产路径请走 SetCreditsDetailedWithExpiry。
 func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
+	p.SetCreditsDetailedWithExpiry(uid, credits, total, expiring, time.Time{}, 0)
+}
+
+// SetCreditsDetailedWithExpiry 更新账号余额/总额、窗口内快过架子集（creditsExpiring），
+// 以及**最早未来到期批次**（earliestAt = 批次到期时刻，earliestRemaining = 该批次剩余量）。
+// 生产调用方：scheduler 的签到 / 余额刷新，数据源 upstream.UserResourceDetailedWithExpiry。
+//
+// 钳制口径（全部为「脏数据不得污染选号」防御，正常上游数据均不触发）：
+//   - credits < 0 → 0（负余额无意义，且会让子集钳制失效）；
+//   - expiring / earliestRemaining 各自钳到 [0, credits]（两者都是 credits 的子集）；
+//   - earliestAt 为零值、不在未来、或 earliestRemaining==0 → 整对字段清空：
+//     「已过期 / 零余额 / 无有效到期时间」三类账号都不进最早到期优先集
+//     （判据见 pickEarliestCreditExpiryLocked）。
+func (p *Pool) SetCreditsDetailedWithExpiry(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if expiring < 0 {
-			expiring = 0
-		}
-		if expiring > credits {
-			expiring = credits
-		}
-		e.credits = credits
-		e.creditsTotal = total
-		e.creditsExpiring = expiring
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	if credits < 0 {
+		credits = 0
+	}
+	if expiring < 0 {
+		expiring = 0
+	}
+	if expiring > credits {
+		expiring = credits
+	}
+	if earliestRemaining < 0 {
+		earliestRemaining = 0
+	}
+	if earliestRemaining > credits {
+		earliestRemaining = credits
+	}
+	if earliestAt.IsZero() || !earliestAt.After(time.Now()) || earliestRemaining == 0 {
+		earliestAt = time.Time{}
+		earliestRemaining = 0
+	}
+	e.credits = credits
+	e.creditsTotal = total
+	e.creditsExpiring = expiring
+	e.creditsEarliestExpiry = earliestAt
+	e.creditsEarliestRemaining = earliestRemaining
+	p.dirty.Store(true)
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolHard 余额耗尽 / CoolSoft 固定短冷却）。

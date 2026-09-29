@@ -429,6 +429,16 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
+  // 夜猫子（既有功能但此前没进配置页，一并补上）与成长任务队列每日自动执行。
+  blackcat_hours: ['schedule', 'blackcat_hours'], blackcat_enabled: ['schedule', 'blackcat_enabled'],
+  growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
+  // Anthropic 兼容层：未命中目录的 claude-* 兜底替换（默认空 = 关闭）。
+  anthropic_default_model: ['anthropic', 'default_model'],
+  anthropic_default_realm: ['anthropic', 'default_realm'],
+  // 请求级可观测性（元数据归档：无提示词/正文/凭证）。
+  request_archive_enabled: ['logging', 'request_archive_enabled'],
+  request_retention_days: ['logging', 'request_retention_days'],
+  request_archive_max_mb: ['logging', 'request_archive_max_mb'],
 };
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {

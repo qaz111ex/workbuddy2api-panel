@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -431,6 +432,125 @@ func translateAnthropicRequest(raw []byte) (*compatChatRequest, *compatReqError)
 }
 
 // ---------------------------------------------------------------------------
+// 入站：anthropic.default_model 兜底替换（**仅** /v1/messages）
+// ---------------------------------------------------------------------------
+
+// anthropicModelSubstitution 一次模型兜底替换的事实（响应标注 + INFO 日志用）。
+// 之所以必须显式透出，是因为静默把 claude-sonnet-4-* 换成目录里的模型会让用户
+// 困惑「我明明要 sonnet，怎么答的是别的模型」。
+type anthropicModelSubstitution struct {
+	requested string // 客户端原始请求名（响应 model 仍回显它）
+	effective string // 实际出站模型名（可能带 cn:/global: 前缀）
+}
+
+// 替换标注字段名（非标准扩展字段；Anthropic SDK 忽略未知键，排障与客户端自检可读）。
+const (
+	anthropicSubstitutedField = "gateway_model_substituted" // bool：是否发生过替换
+	anthropicRequestedField   = "gateway_model_requested"   // string：客户端原名
+	anthropicEffectiveField   = "gateway_model_effective"   // string：实际出站名
+)
+
+// markAnthropicModelSubstitution 把替换事实标注到 Anthropic message 对象上。
+// sub == nil（未替换）时不加任何字段——未配置 anthropic.default_model 的响应形状
+// 与改造前逐字节一致。
+func markAnthropicModelSubstitution(obj map[string]any, sub *anthropicModelSubstitution) {
+	if sub == nil {
+		return
+	}
+	obj[anthropicSubstitutedField] = true
+	obj[anthropicRequestedField] = sub.requested
+	obj[anthropicEffectiveField] = sub.effective
+}
+
+// normalizeAnthropicRealm 归一 anthropic.default_realm：只认 cn / global（大小写不
+// 敏感、容忍首尾空白），其余（含空串）→ 无前缀。非法值退化为裸名，而不是拼出网关
+// 路由协议不认的前缀——"weird:glm-5.2" 会被 resolveModel 当成裸名（冒号留在里面），
+// 那比不带前缀更糟。
+func normalizeAnthropicRealm(realm string) string {
+	switch strings.ToLower(strings.TrimSpace(realm)) {
+	case "cn":
+		return "cn"
+	case "global":
+		return "global"
+	}
+	return ""
+}
+
+// anthropicModelInCatalog 报告裸模型名是否已命中网关只读目录快照（与 hintContext /
+// realmModelState("cn") 同一数据源：cachedModelsSnapshot）。缓存冷 / 过期 / 未拉取
+// → false（宁缺勿滥，不编造目录事实）。**零上游调用**。
+func anthropicModelInCatalog(model string) bool {
+	for _, mi := range cachedModelsSnapshot() {
+		if mi.ID == model {
+			return true
+		}
+	}
+	return false
+}
+
+// substituteAnthropicModel 纯函数：决定 /v1/messages 的最终出站模型名，返回
+// (最终模型名, 是否发生替换)。
+//
+// 规则（严格按接口契约）：
+//  1. 请求名带 cn: / global: 前缀 → 原样不动（显式前缀是网关路由协议的表达，
+//     用户显式指定的模型一律不篡改）；
+//  2. 请求名已命中网关只读目录 → 原样不动（同上：不能改掉用户显式指定的可用模型）；
+//  3. 未命中且 defModel 非空 → 替换为 [defRealm:]defModel（realm 非法/为空则裸名）；
+//  4. defModel 为空 → 原样返回 + false（未配置时行为与现状逐字一致）。
+//
+// 目录判定只读 cachedModelsSnapshot，**绝不触发上游拉取**：请求路径上加一次
+// FetchModels 网络调用既拖慢首字延迟，又与本仓库「错误/hint 路径不拉上游」的既有
+// 设计相悖。
+func substituteAnthropicModel(reqModel, defModel, defRealm string) (string, bool) {
+	req := strings.TrimSpace(reqModel)
+	def := strings.TrimSpace(defModel)
+	if req == "" || def == "" {
+		return reqModel, false // 规则 4：未配置 → 现状语义
+	}
+	if HasRealmPrefix(req) {
+		return reqModel, false // 规则 1：显式前缀原样
+	}
+	if anthropicModelInCatalog(req) {
+		return reqModel, false // 规则 2：命中目录原样
+	}
+	if realm := normalizeAnthropicRealm(defRealm); realm != "" {
+		return realm + ":" + def, true // 规则 3
+	}
+	return def, true
+}
+
+// rewriteChatBodyModel 把翻译后的 chat 请求体里的 model 换成 final，其余字段逐字
+// 保留（body 本就是 map → json.Marshal 的产物，键序稳定，重写无额外语义变化）。
+func rewriteChatBodyModel(body []byte, final string) []byte {
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil {
+		return body
+	}
+	obj["model"] = final
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return raw
+}
+
+// applyAnthropicDefaultModel /v1/messages 入站路径上的兜底替换入口。未替换 → nil
+// 且 tr 逐字不变（未配置字段时零行为变化）；发生替换 → 重写 chat body 的 model
+// 字段 + INFO 日志 + 返回替换事实供响应标注。
+//
+// tr.model（响应回显用）**刻意不改**：Anthropic 语义里响应 model = 请求 model，
+// 替换事实由 gateway_model_* 字段显式透出（见 anthropicModelSubstitution）。
+func (h *Handler) applyAnthropicDefaultModel(tr *compatChatRequest) *anthropicModelSubstitution {
+	final, replaced := substituteAnthropicModel(tr.model, h.cfg.AnthropicDefaultModel, h.cfg.AnthropicDefaultRealm)
+	if !replaced {
+		return nil
+	}
+	tr.body = rewriteChatBodyModel(tr.body, final)
+	log.Printf("INFO: [anthropic] 模型名未命中网关目录，按 anthropic.default_model 替换: %q -> %q", tr.model, final)
+	return &anthropicModelSubstitution{requested: tr.model, effective: final}
+}
+
+// ---------------------------------------------------------------------------
 // 出站：chat → Anthropic message / SSE
 // ---------------------------------------------------------------------------
 
@@ -470,7 +590,9 @@ func anthropicToolUseBlock(tc any) (map[string]any, bool) {
 // anthropicMessageObject chat 聚合响应 → Anthropic message 对象（非流式）。
 // model 回显**客户端请求的模型名**（Anthropic 语义：响应 model 即请求 model），
 // 而不是上游裸名——带 cn:/global: 前缀的客户端请求才不会因模型名变化而误判。
-func anthropicMessageObject(chat map[string]any, reqModel string) map[string]any {
+// 发生 anthropic.default_model 兜底替换时，替换事实经 sub 标注为 gateway_model_*
+// 扩展字段（见 markAnthropicModelSubstitution），model 字段本身仍回显原始请求名。
+func anthropicMessageObject(chat map[string]any, reqModel string, sub *anthropicModelSubstitution) map[string]any {
 	content := make([]any, 0, 2)
 	var msg map[string]any
 	if c := chatChoices(chat); c != nil {
@@ -494,7 +616,7 @@ func anthropicMessageObject(chat map[string]any, reqModel string) map[string]any
 	if toolUse > 0 {
 		stop = "tool_use" // 有 tool_use 块时 stop_reason 必须是 tool_use
 	}
-	return map[string]any{
+	obj := map[string]any{
 		"id":            newCompatID("msg_"),
 		"type":          "message",
 		"role":          "assistant",
@@ -504,10 +626,12 @@ func anthropicMessageObject(chat map[string]any, reqModel string) map[string]any
 		"stop_sequence": nil,
 		"usage":         anthropicUsageOf(chat),
 	}
+	markAnthropicModelSubstitution(obj, sub)
+	return obj
 }
 
 // writeAnthropicFromChat 非流式出站：内层聚合响应（或错误体）→ Anthropic 形态。
-func writeAnthropicFromChat(em *compatEmitter, cap *compatCapture, reqModel string) {
+func writeAnthropicFromChat(em *compatEmitter, cap *compatCapture, reqModel string, sub *anthropicModelSubstitution) {
 	if cap.status >= 400 {
 		info := readCompatError(cap.status, cap.body)
 		em.emitJSON(info.status, anthropicErrorBody(anthropicErrType(info.status), info.message, info.hint, info.code))
@@ -523,7 +647,7 @@ func writeAnthropicFromChat(em *compatEmitter, cap *compatCapture, reqModel stri
 		em.emitJSON(info.status, anthropicErrorBody(anthropicErrType(info.status), info.message, info.hint, info.code))
 		return
 	}
-	em.emitJSON(http.StatusOK, anthropicMessageObject(chat, reqModel))
+	em.emitJSON(http.StatusOK, anthropicMessageObject(chat, reqModel, sub))
 }
 
 // ---------------------------------------------------------------------------
@@ -542,16 +666,22 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", cerr.message, "")
 		return
 	}
+	// anthropic.default_model 兜底替换：**仅本端点**。Claude Code 默认发
+	// claude-sonnet-4-* 这类原生 Anthropic 模型名，而网关目录里没有这些 id，
+	// 不兜底就直接失败、用户被迫手工设 ANTHROPIC_MODEL——这是接入摩擦最大的一处。
+	// 未配置（AnthropicDefaultModel 为空）时 sub == nil，行为与改造前逐字一致。
+	sub := h.applyAnthropicDefaultModel(tr)
 	em := newCompatEmitter(w)
 	if tr.stream {
 		iw := newAnthropicStreamWriter(em, tr.model)
+		iw.sub = sub
 		h.runInnerChat(iw, r, tr.body)
 		iw.finish()
 		return
 	}
 	cap := newCompatCapture()
 	h.runInnerChat(cap, r, tr.body)
-	writeAnthropicFromChat(em, cap, tr.model)
+	writeAnthropicFromChat(em, cap, tr.model, sub)
 }
 
 // messagesCountTokens POST /v1/messages/count_tokens。
@@ -635,6 +765,9 @@ func estimateTokensOfText(s string) int {
 type anthropicStreamWriter struct {
 	em    *compatEmitter
 	model string
+	// sub anthropic.default_model 兜底替换事实（nil = 未替换）。在 message_start
+	// 的 message 对象上标注 gateway_model_* 字段，与**非流式**响应同口径。
+	sub *anthropicModelSubstitution
 
 	hdr     http.Header
 	status  int    // 内层 WriteHeader 声明的状态（0 = 未声明 → 流式成功）
@@ -777,18 +910,20 @@ func (w *anthropicStreamWriter) ensureStart() {
 		return
 	}
 	w.msgStarted = true
+	msg := map[string]any{
+		"id":            newCompatID("msg_"),
+		"type":          "message",
+		"role":          "assistant",
+		"model":         w.model,
+		"content":       []any{},
+		"stop_reason":   nil,
+		"stop_sequence": nil,
+		"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+	}
+	markAnthropicModelSubstitution(msg, w.sub)
 	w.em.emitEvent("message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id":            newCompatID("msg_"),
-			"type":          "message",
-			"role":          "assistant",
-			"model":         w.model,
-			"content":       []any{},
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
-		},
+		"type":    "message_start",
+		"message": msg,
 	})
 }
 

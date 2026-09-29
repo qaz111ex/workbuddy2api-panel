@@ -45,6 +45,15 @@ type Pool struct {
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// preferExpiring / expiringWindow 最早到期优先路由的开关与窗口（SetPreferExpiring 注入）。
+	// 生效（enabled && window > 0）时，pick 在**成本最优层内**先按最早到期升序挑选——
+	// 把快过期的积分先花掉，避免官方活动赠送的奖励积分到期作废；优先集为空则完全退回
+	// 既有加权随机。窗口复用采集侧已有的 pool.expiring_soon（不新增配置项）：采集用它
+	// 决定 creditsExpiring 分桶，选号侧拿同一窗口做二次门槛（见 pickEarliestCreditExpiryLocked）。
+	// 默认 preferExpiring=true + expiringWindow=0：窗口 0 = 未接线 → 关，
+	// 行为与引入前逐字一致（兼容性闸门）。
+	preferExpiring bool
+	expiringWindow time.Duration
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -83,6 +92,9 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		// 最早到期优先路由：开关默认开，但窗口默认 0（= 未接线）→ 实际关；
+		// 由 main 经 SetPreferExpiring 注入 expiring_soon 窗口后生效。
+		preferExpiring:     true,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -174,6 +186,23 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
 	}
+}
+
+// SetPreferExpiring 注入「最早到期优先路由」的开关与窗口（main 从 config 解析后调用；
+// 窗口直接复用已有的 pool.expiring_soon，不新增配置项）。热改安全（持写锁，下一次
+// pick 立即生效）。
+//
+// 生效条件 = enabled && window > 0。任一不满足即**完全退回**既有加权随机路径
+// （兼容性闸门）：enabled=false 或 window<=0 时，选号决策与引入前逐字一致。
+// 负窗口按 0 处理（关）。
+func (p *Pool) SetPreferExpiring(enabled bool, window time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if window < 0 {
+		window = 0
+	}
+	p.preferExpiring = enabled
+	p.expiringWindow = window
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

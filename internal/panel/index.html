@@ -645,6 +645,28 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">/panel/* 只认这个；建议设置且不外发——留空则面板复用 API 密钥（等于数据面 key 可开面板），立即生效</span></label>
             </div>
           </div>
+
+          <div class="hr"></div>
+          <div class="grid2">
+            <label class="fld"><span class="lb">Anthropic 兜底模型</span>
+              <input name="anthropic_default_model" placeholder="留空 = 不替换">
+              <span class="hint">Claude Code 默认发 claude-* 模型名，网关目录没有 → 报错。填一个目录内模型名（如 deepseek-v4.1-flash）即可开箱即用；命中目录或带 cn:/global: 前缀的名字不会被改。需重启生效</span></label>
+            <label class="fld"><span class="lb">兜底模型域前缀</span>
+              <input name="anthropic_default_realm" placeholder="cn / global / 留空">
+              <span class="hint">留空 = 不带前缀（走默认域 + 跨域回落）</span></label>
+          </div>
+          <div class="hr"></div>
+          <div class="grid2">
+            <div class="switch"><span class="lb">请求元数据归档</span>
+              <input type="checkbox" name="request_archive_enabled"></div>
+            <label class="fld"><span class="lb">保留天数</span>
+              <input name="request_retention_days" type="number" min="1" placeholder="7"></label>
+          </div>
+          <div class="grid2">
+            <label class="fld"><span class="lb">归档容量上限（MiB）</span>
+              <input name="request_archive_max_mb" type="number" min="1" placeholder="100">
+              <span class="hint">只存元数据（请求 id / 路径 / 账号标签 / 模型 / 状态 / 耗时 / 重试 / token 计数 / 扣费），<b>不含提示词、响应正文或任何凭证</b>；超限优先删最旧</span></label>
+          </div>
         </div>
 
         <div class="box">
@@ -679,6 +701,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <label class="fld"><span class="lb">上报时点（小时，逗号分隔）</span>
                   <input name="activity_hours" placeholder="10">
                   <span class="hint">点亮连登 + 解锁领养前置</span></label>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
+              <div>
+                <div class="switch"><span class="lb">夜猫子对话</span>
+                  <input type="checkbox" name="blackcat_enabled"></div>
+                <label class="fld"><span class="lb">触发时点（小时，逗号分隔）</span>
+                  <input name="blackcat_hours" placeholder="23">
+                  <span class="hint">23:00–08:00 窗口内对话补足</span></label>
+              </div>
+              <div>
+                <div class="switch"><span class="lb">成长任务自动执行</span>
+                  <input type="checkbox" name="growth_enabled"></div>
+                <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
+                  <input name="growth_hours" placeholder="1">
+                  <span class="hint">Sequential 链每日解锁一环；默认 1 点（避开 0 点解锁竞态）</span></label>
               </div>
             </div>
             <div class="hr"></div>

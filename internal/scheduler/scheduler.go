@@ -1,4 +1,5 @@
-// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive 四类独立排程。
+// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive /
+// 夜猫子 / 成长任务队列 六类独立排程。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
 package scheduler
 
@@ -29,6 +30,11 @@ type Config struct {
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
+	// GrowthHours 成长任务队列每日自动执行的时点（默认 [1]：凌晨 1 点）。
+	// 刻意避开 0 点整：Sequential 小程序任务族在零点解锁下一环，恰好 0 点触发会
+	// 抢在解锁写库之前扫描，扫到的还是 locked 形态（growthPending 判为无待办），
+	// 白跑一轮；1 点给解锁留出窗口。
+	GrowthHours []int
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
 	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
@@ -47,6 +53,9 @@ type Config struct {
 	KeepaliveDisabled bool
 	// BlackcatDisabled 显式关闭夜猫子排程（schedule.blackcat_enabled=false）。
 	BlackcatDisabled bool
+	// GrowthDisabled 显式关闭成长任务队列自动执行（schedule.growth_enabled=false）。
+	// 禁用后 nextWake 不产生 growth 候选，也就没有任何自动点。
+	GrowthDisabled bool
 }
 
 // Scheduler 调度器。
@@ -68,6 +77,11 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// growthHook 成长任务队列的执行入口（面板 RunGrowthQueueOnce），由 SetGrowthHook
+	// 接线。scheduler 不 import panel（依赖方向单向），到点只回调这个函数值。
+	// 由 schedMu 保护：与排程参数一起在运行期可热改。
+	growthHook func(ctx context.Context)
 }
 
 // New 构建。
@@ -86,6 +100,9 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.BlackcatHours) == 0 {
 		cfg.BlackcatHours = []int{23}
+	}
+	if len(cfg.GrowthHours) == 0 {
+		cfg.GrowthHours = []int{1}
 	}
 	return &Scheduler{
 		cfg:           cfg,
@@ -125,6 +142,36 @@ func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepal
 	poke(s.rearmBalance)
 }
 
+// SetGrowthSchedule 热更新成长任务队列自动执行的时点与开关（面板保存配置后调用）。
+// 单独一个方法而不塞进 Reconfigure：Reconfigure 的实参列表已被调用方逐个对位，
+// 追加参数会强制所有调用点（含 cmd/server）同步改动；这里零破坏地扩展。
+// 空 hours 视为「未配置」保留原值（与 Reconfigure / config.normalize 的回落语义一致）。
+func (s *Scheduler) SetGrowthSchedule(hours []int, disabled bool) {
+	s.schedMu.Lock()
+	if len(hours) > 0 {
+		s.cfg.GrowthHours = hours
+	}
+	s.cfg.GrowthDisabled = disabled
+	s.schedMu.Unlock()
+	poke(s.rearmSchedule)
+}
+
+// SetGrowthHook 接线成长任务队列的执行入口（面板 RunGrowthQueueOnce）。
+// 装配期调用即可；运行期调用同样安全（schedMu 保护，正在执行的 hook 不受影响）。
+// 未接线（nil）时到点静默跳过——scheduler 包不依赖 panel，接线由 cmd/server 负责。
+func (s *Scheduler) SetGrowthHook(fn func(ctx context.Context)) {
+	s.schedMu.Lock()
+	s.growthHook = fn
+	s.schedMu.Unlock()
+}
+
+// growthHookFn 锁内读出当前 hook（可能为 nil）。
+func (s *Scheduler) growthHookFn() func(context.Context) {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.growthHook
+}
+
 // poke 非阻塞发一次唤醒信号（已有待处理信号则忽略，语义等价）。
 func poke(ch chan struct{}) {
 	select {
@@ -157,6 +204,7 @@ const (
 	taskActivity
 	taskKeepalive
 	taskBlackcat
+	taskGrowth
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -167,8 +215,10 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	s.schedMu.Lock()
 	checkinHours, keepaliveHours, blackcatHours := s.cfg.CheckinHours, s.cfg.KeepaliveHours, s.cfg.BlackcatHours
 	travelHours, activityHours := s.cfg.TravelHours, s.cfg.ActivityHours
+	growthHours := s.cfg.GrowthHours
 	checkinOff, keepaliveOff, blackcatOff := s.cfg.CheckinDisabled, s.cfg.KeepaliveDisabled, s.cfg.BlackcatDisabled
 	travelOff, activityOff := s.cfg.TravelDisabled, s.cfg.ActivityDisabled
+	growthOff := s.cfg.GrowthDisabled
 	s.schedMu.Unlock()
 
 	type slot struct {
@@ -190,6 +240,11 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !blackcatOff {
 		slots = append(slots, slot{nextFire(now, blackcatHours), taskBlackcat})
+	}
+	// growth 追加在末位：同槽位多族时它的 familyStagger 偏移最大（idx 最大）。
+	// Sequential 小程序任务族每日零点解锁一环，默认 01:00 单独成槽（idx 0）无偏移。
+	if !growthOff {
+		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -316,13 +371,20 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 	}
 }
 
+// schedNow 排程时钟读数源（生产为 time.Now）。声明为变量是**测试接缝**：
+// nextFire 的粒度是整点，真实时钟下要验证「到点真的派发了某族」最坏得等到下一个
+// 整点（59 分钟）——成长任务自动执行这类「每天到点是否真的动了」的行为，在真实
+// 时钟下无法低成本验证。测试把它钉在槽位前一小时，再让 wallclockNow 越过槽位，
+// waitSlot 立即 slotFired，无需真实等待。生产路径零差异。
+var schedNow = time.Now
+
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
-		next, kinds := s.nextWake(time.Now())
+		next, kinds := s.nextWake(schedNow())
 		if next.IsZero() {
-			// 四类任务全部禁用：不空转，等重排通知（在线改配置重新启用）或退出信号。
+			// 全部任务族禁用：不空转，等重排通知（在线改配置重新启用）或退出信号。
 			select {
 			case <-ctx.Done():
 				return
@@ -377,10 +439,36 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 				s.RunKeepaliveNow()
 			case taskBlackcat:
 				s.RunBlackcatNow()
+			case taskGrowth:
+				s.runGrowth(ctx)
 			}
 		}(k, idx)
 	}
 	wg.Wait()
+}
+
+// runGrowth 成长任务队列的每日自动执行：回调外部接线的执行入口（面板
+// RunGrowthQueueOnce），把「扫描待办 + 执行队列」原样交给面板——队列状态机
+// （先占位 / 陈旧占位兜底 / 无待办回滚）只有一份，排程不旁路它。
+//
+// 为什么用回调而不是 scheduler 直接调 panel：依赖方向单向（scheduler 只依赖
+// pool/upstream），接线由 cmd/server 在装配期用 SetGrowthHook 完成；未接线时
+// 明确跳过并落一行日志（每天一行的噪音远小于「到点了却什么都没发生」的沉默失败）。
+//
+// ctx 原样传给 hook：面板队列在项间收尾（优雅停机不等限速睡满）。已在飞行的上游
+// 请求无 ctx，取消不能打断它——与手动入口的限制相同。
+func (s *Scheduler) runGrowth(ctx context.Context) {
+	if ctx.Err() != nil {
+		log.Printf("scheduler: 成长任务队列自动执行放弃：%v", ctx.Err())
+		return
+	}
+	hook := s.growthHookFn()
+	if hook == nil {
+		log.Printf("scheduler: 成长任务队列自动执行未接线（SetGrowthHook 未调用），跳过")
+		return
+	}
+	log.Printf("scheduler: 成长任务队列自动执行到点，交给面板队列入口")
+	hook(ctx)
 }
 
 // familyStagger 同一槽位内多个任务族之间的启动错开量。
@@ -453,15 +541,20 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		//
+		// 用 WithExpiry 版拿到**最早到期批次**（earliestAt/earliestRemaining）：只靠
+		// 窗口内总量无法判断「谁先过期」，选号优先也就无从谈起。它与旧函数共用同一份
+		// 响应体（**零新增上游请求**）——时间戳本就在解析，此前算完求和就丢掉了。
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		if expiring > 0 {
-			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring)
-		}
+		// ⚠️ 顺序不能颠倒：ReenableIfCredits 会清空最早批次快照，必须在它**之后**写入。
+		// 且**无条件调用**（不再 `if expiring > 0`）：窗内无到期量时也要把 earliest*
+		// 落成零值，否则被 ReenableIfCredits 清掉的快照不会重建。
+		s.cfg.Pool.SetCreditsDetailedWithExpiry(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
 	s.RunStreakBonusNow()
 }
@@ -574,13 +667,17 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, s.cfg.ExpiringSoonWindow)
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
 				return
 			}
+			// 保留本处既有的 if/else 语义（有窗内到期量 → Detailed 写入；否则 →
+			// ReenableIfCredits 解冻），只把两处换成 WithExpiry 版以带上最早到期批次。
+			// 注：本分支里 expiring>0 时**不调** ReenableIfCredits，故不存在
+			// 「解冻清空快照 → 覆盖写入」的顺序问题（那是上面签到路径的形状）。
 			if expiring > 0 {
-				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
+				s.cfg.Pool.SetCreditsDetailedWithExpiry(uid, remain, total, expiring, earliestAt, earliestRemaining)
 			} else {
 				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			}

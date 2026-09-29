@@ -33,8 +33,15 @@ import (
 // ModelsDevURL models.dev 官方聚合 JSON 端点（唯一端点，见文件头逆向结论）。
 const ModelsDevURL = "https://models.dev/api.json"
 
-// modelsDevTimeout 单次拉取超时：兜底的兜底，不值得等（任务书 §2：如 5s）。
-const modelsDevTimeout = 5 * time.Second
+// modelsDevTimeout 单次拉取超时（含**响应体读取**）。
+//
+// 曾是 5s（「兜底的兜底，不值得等」）。但该理由只对**同步**调用成立——本拉取是在
+// 后台 goroutine 里跑的（ensureDocAsync），**不阻塞任何用户请求**，所以「不值得等」
+// 这个成本其实不存在。而 api.json 实测约 4.7MB，5s 意味着需要 ~1MB/s 的稳定带宽：
+// 国际链路较慢（或经代理）时会**稳定**在读取阶段超时——表现就是用户日志里那条
+// `models.dev fetch read: context deadline exceeded`，于是这份补充数据永远拿不到。
+// 放宽到 30s：对用户仍零延迟（后台跑），却让慢链路也能真正拉下来。
+const modelsDevTimeout = 30 * time.Second
 
 // modelsDevFetchCooldown 拉取节流（进程级）：文档是全量聚合体，5min 内不重拉
 // （同模型 24h 负缓存之外的整体节流，防短窗反复打 models.dev）。
@@ -216,7 +223,7 @@ func (f *modelsDevFetcher) ensureDocAsync(client *http.Client, baseOverride stri
 // 静默 WARN + 返回（与 fetch 失败同语义，降级 1M 兜底）让疏漏显式化。
 func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 	if client == nil {
-		log.Printf("WARN: [upstream] models.dev fetch: nil client rejected (no DefaultClient fallback, silent fallback to 1M)")
+		log.Printf("WARN: [upstream] models.dev fetch: nil client rejected (no DefaultClient fallback; silent fallback to static catalog/1M, non-fatal)")
 		return
 	}
 	url := ModelsDevURL
@@ -232,22 +239,25 @@ func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("WARN: [upstream] models.dev fetch failed (silent fallback to 1M): %v", err)
+		log.Printf("WARN: [upstream] models.dev fetch failed (silent fallback to static catalog/1M, non-fatal): %v", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("WARN: [upstream] models.dev fetch status %d (silent fallback to 1M)", resp.StatusCode)
+		log.Printf("WARN: [upstream] models.dev fetch status %d (silent fallback to static catalog/1M, non-fatal)", resp.StatusCode)
 		return
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, modelsDevMaxBody))
 	if err != nil {
-		log.Printf("WARN: [upstream] models.dev fetch read: %v", err)
+		// 文案与其它失败路径统一：这条此前**漏了**「silent fallback」措辞，导致用户在
+		// 日志里看到一条 WARN 却无法判断是否要紧（实测就有用户来问）。本拉取是后台
+		// 异步、第四优先级的数据源，失败一律只是「该补充数据不可用」，不影响任何请求。
+		log.Printf("WARN: [upstream] models.dev fetch read failed (silent fallback to static catalog/1M, non-fatal): %v", err)
 		return
 	}
 	doc, err := parseModelsDevDoc(raw)
 	if err != nil {
-		log.Printf("WARN: [upstream] models.dev parse failed (silent fallback to 1M): %v", err)
+		log.Printf("WARN: [upstream] models.dev parse failed (silent fallback to static catalog/1M, non-fatal): %v", err)
 		return
 	}
 	f.mu.Lock()

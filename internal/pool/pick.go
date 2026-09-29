@@ -1,4 +1,4 @@
-// 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 全冷却兜底 + 在途占满过滤）。
+// 选号：Pick 簇（healthy 成本最优层内最早到期优先/三因子加权 Top5 短名单 + 加权随机 + 全冷却兜底 + 在途占满过滤）。
 package pool
 
 import (
@@ -179,41 +179,49 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		cands = append(cands, c.e)
 	}
 	// candsAll 保留截断前的全候选（权重降序），供 LRU 兜底在全量范围选最旧者，
-	// 避免 top5 字典序截断把等权重靠后账号饿死（惊群根因之一）。
+	// 避免 top5 字典序截断把等权重靠后账号饿死（惊群根因之一）。同时是**最早到期优先**
+	// 的候选范围：路由只在成本最优层内挑，不因 top5 截断而漏掉快过期的号。
 	candsAll := cands
 	if len(cands) > 5 {
 		cands = cands[:5]
 	}
-	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
-	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
-	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
-	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入。
-	eligible := make([]*entry, 0, len(cands))
-	eligibleW := make([]float64, 0, len(cands)) // 与 eligible 平行的预计算权重（避免 pickWeighted 重算）
-	weightOfEntry := make(map[*entry]float64, len(ws))
-	for _, wc := range ws {
-		weightOfEntry[wc.e] = wc.w
-	}
-	for _, e := range cands {
-		if now.Sub(e.lastUsed) >= minPickGap {
-			eligible = append(eligible, e)
-			eligibleW = append(eligibleW, weightOfEntry[e])
-		}
-	}
+	// 最早到期优先（enabled && window>0 时生效）：优先集非空 → 直接按最早到期升序取
+	// 第一个；优先集为空 → 返回 nil，**完全退回**下方既有加权随机路径（兼容性闸门）。
 	var e *entry
-	if len(eligible) == 0 {
-		// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
-		// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
-		// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
-		// candsAll[0] 导致集中。usedSeq 严格全序，与时间精度无关。
-		e = candsAll[0]
-		for _, c := range candsAll[1:] {
-			if c.usedSeq < e.usedSeq {
-				e = c
+	if p.preferExpiring && p.expiringWindow > 0 {
+		e = p.pickEarliestCreditExpiryLocked(candsAll, now)
+	}
+	if e == nil {
+		// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
+		// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
+		// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
+		// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入。
+		eligible := make([]*entry, 0, len(cands))
+		eligibleW := make([]float64, 0, len(cands)) // 与 eligible 平行的预计算权重（避免 pickWeighted 重算）
+		weightOfEntry := make(map[*entry]float64, len(ws))
+		for _, wc := range ws {
+			weightOfEntry[wc.e] = wc.w
+		}
+		for _, c := range cands {
+			if now.Sub(c.lastUsed) >= minPickGap {
+				eligible = append(eligible, c)
+				eligibleW = append(eligibleW, weightOfEntry[c])
 			}
 		}
-	} else {
-		e = p.pickWeightedPrecomputed(eligible, eligibleW) // eligible 保序 = top5 降序子集
+		if len(eligible) == 0 {
+			// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
+			// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
+			// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
+			// candsAll[0] 导致集中。usedSeq 严格全序，与时间精度无关。
+			e = candsAll[0]
+			for _, c := range candsAll[1:] {
+				if c.usedSeq < e.usedSeq {
+					e = c
+				}
+			}
+		} else {
+			e = p.pickWeightedPrecomputed(eligible, eligibleW) // eligible 保序 = top5 降序子集
+		}
 	}
 	if explored {
 		// 探索事件日志：选中号此时才确定，故在选中点打出。
@@ -225,6 +233,63 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
 	return e.a
+}
+
+// pickEarliestCreditExpiryLocked 最早到期优先：在**成本最优层**候选（candsAll，
+// 已按模型成本过滤/分层）中筛出「窗口内仍有积分、且有有效未来到期批次」的账号，
+// 按最早到期升序返回第一个可选的（同到期时刻 → 该批次剩余积分多者优先；再同 → UID 字典序）。
+//
+// 优先集判据（四项全满足，任一不满足即不进优先集）：
+//   - credits > 0：零余额号（含陈旧快照）不得插队；
+//   - creditsExpiring > 0：配置窗口内确有快过期积分（窗口已在采集侧折算进该字段）；
+//   - creditsEarliestRemaining > 0：最早批次仍有剩余（零余额批次不算有效批次）；
+//   - creditsEarliestExpiry ∈ (now, now+window]：有有效到期时间、尚未过期、且在窗口内。
+//     已过期 / 无有效到期时间（零值）的账号一律不进优先集。
+//
+// 窗口二次门槛与采集侧 expiring_soon 同源：窗口缩小后，旧快照中「窗内最早」会落在
+// now+window 之外而被自动排除（防 stale 快照拿着旧窗口继续插队）。
+//
+// 防并发撞号：与既有选号路径同口径——按上述排序取第一个距上次选中 ≥ minPickGap 的
+// 账号；优先集全部刚被用过时（同一瞬间的并发请求）才取排序首位，避免把请求硬撞到
+// 同一个号上而失去轮换。
+//
+// 优先集为空返回 nil，调用方据此**完全退回**既有加权随机（兼容性闸门）。
+// 调用方需已持 p.mu（写锁）；本方法只读 entry 字段，不修改任何状态。
+func (p *Pool) pickEarliestCreditExpiryLocked(cands []*entry, now time.Time) *entry {
+	if len(cands) == 0 {
+		return nil
+	}
+	deadline := now.Add(p.expiringWindow)
+	priority := make([]*entry, 0, len(cands))
+	for _, c := range cands {
+		if c.credits <= 0 || c.creditsExpiring <= 0 || c.creditsEarliestRemaining <= 0 {
+			continue
+		}
+		if c.creditsEarliestExpiry.IsZero() ||
+			!c.creditsEarliestExpiry.After(now) ||
+			c.creditsEarliestExpiry.After(deadline) {
+			continue
+		}
+		priority = append(priority, c)
+	}
+	if len(priority) == 0 {
+		return nil
+	}
+	sort.SliceStable(priority, func(i, j int) bool {
+		if !priority[i].creditsEarliestExpiry.Equal(priority[j].creditsEarliestExpiry) {
+			return priority[i].creditsEarliestExpiry.Before(priority[j].creditsEarliestExpiry)
+		}
+		if priority[i].creditsEarliestRemaining != priority[j].creditsEarliestRemaining {
+			return priority[i].creditsEarliestRemaining > priority[j].creditsEarliestRemaining
+		}
+		return priority[i].a.UID < priority[j].a.UID
+	})
+	for _, c := range priority {
+		if now.Sub(c.lastUsed) >= minPickGap {
+			return c
+		}
+	}
+	return priority[0]
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
