@@ -24,6 +24,22 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	}
 }
 
+// NoteCheckinDone 标记账号今日已签到（签到成功，与上游「今天已签到」幂等拒绝都算——
+// 两者对"今天还要不要再签"是同一答案）。记录本地日期，跨零点自然过期；
+// 不触碰冷却/禁用状态（签到与冷却域正交，见 reviveCoolingLocked）。
+// statusOf 据此输出 Status.CheckinDone，面板签到按钮显示 签到/已签。
+func (p *Pool) NoteCheckinDone(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		day := time.Now().Format("2006-01-02")
+		if e.lastCheckinDay != day {
+			e.lastCheckinDay = day
+			p.dirty.Store(true)
+		}
+	}
+}
+
 // SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
 // 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
 // 不污染权重。
@@ -306,6 +322,10 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
+// ReenableIfCredits 签到/余额刷新后解冻：仅当 remain > 0 且账号非禁用时，写回余额并
+// 解冻**余额耗尽冷却**（CoolHard）。软限流（CoolSoft）与模型级台账（modelCooldowns）
+// 不在此清除——它们的恢复证据是上游重置墙钟到期或探测成功，不是余额恢复（余额刷新
+// 周期任务每 5 分钟到达这里，全清会把限流冷却的实际寿命压到一个刷新周期内，
+// upstream 602ed1b）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
-// reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。
+// 实现已迁至 transition.go（状态机迁移唯一权威实现）。

@@ -77,11 +77,15 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
+	Realm          string `json:"realm,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	SuccessCount   int64  `json:"success_count,omitempty"`
+	ErrTotal       int64  `json:"err_total,omitempty"`
+	// CheckinDone 本地今日已签到（签到成功，或上游「今天已签到」幂等拒绝——两者都算，
+	// 见 NoteCheckinDone）。跨零点自然过期；global 域账号无签到体系，恒为 false。
+	// 面板签到按钮据此显示 签到/已签。
+	CheckinDone     bool       `json:"checkin_done,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
 	LastErrTime     time.Time  `json:"last_err,omitempty"`
 	TokenUsage      TokenUsage `json:"token_usage,omitempty"`
@@ -174,11 +178,15 @@ type entry struct {
 	lastErr         time.Time  // 最近一次错误时间
 	lastSuccess     time.Time  // 最近一次成功时间
 	tokenUsage      TokenUsage // 聊天请求 token 用量摘要（持久化）
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// lastCheckinDay 最近一次「已签到」的本地日期（"2006-01-02"）。签到成功与上游
+	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 Status.CheckinDone 供面板按钮
+	// 显示 签到/已签。持久化（stateAccount.LastCheckinDay）：跨重启不丢当日状态。
+	lastCheckinDay string
+	coolKind       CoolKind
+	until          time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled       bool
+	reason         string
+	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -265,13 +273,21 @@ func (e *entry) healthy(now time.Time) bool {
 }
 
 // modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
+// 模型级冷却（modelCooldowns 非空），且尚未禁用、也不在任何**账号级不可用期**
+// （until 冷却 / degradeUntil 连败降权 / breakerUntil 熔断）。
 // 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
+//
+// 为何排除 until/degradeUntil（upstream 5f6c7ca）：旧实现只看 disabled 与
+// breakerUntil——账号正处账号级冷却（until 未过）或连败降权期时仍被判为「模型豁免」，
+// 探活/可达性会把一个整体不可用的账号报成可服务（ServableForRealm 的
+// healthy||modelExempt 是或门，误报直接变成 /healthz 200 而 chat 全 503）。
+// 豁免的前提是「账号本身可用，只是某几个模型被限流」——账号级不可用期与模型级
+// 豁免互斥，故这里一并排除。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero()
+		!e.disabled && e.until.IsZero() && e.degradeUntil.IsZero() && e.breakerUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -390,11 +406,14 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount    int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess time.Time  `json:"last_success,omitempty"`
-	LastErr     time.Time  `json:"last_err,omitempty"`
-	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
+	ErrTotal    int64     `json:"err_total,omitempty"`
+	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastErr     time.Time `json:"last_err,omitempty"`
+	// LastCheckinDay 最近一次「已签到」的本地日期（entry.lastCheckinDay 同源）。
+	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
+	LastCheckinDay string     `json:"last_checkin_day,omitempty"`
+	TokenUsage     TokenUsage `json:"token_usage,omitempty"`
 	// 运行态计数（soft_streak/session_dead_fails/credits_expiring）不用 omitempty：
 	// 零值缺失会让人误以为"没记录"，实际是零值被省略。
 	SoftStreak int `json:"soft_streak"`

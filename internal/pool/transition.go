@@ -11,22 +11,27 @@
 //	disabled           ← disableLocked（Disable / NoteSessionDead 达阈）
 //	until/coolKind     ← Cooldown(CoolSoft/Hard) / CooldownSoftForModel 无解析分支
 //	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked 清
+//	                     （reviveCoolingLocked 不清——余额恢复不构成限流解除证据）
 //	breakerUntil       ← recordBreakerFailureLocked（Cooldown/NoteError 喂入）；NoteSuccess 清
-//	softStreak         ← Cooldown(CoolSoft)/CooldownSoftForModel；NoteSuccess/reviveCoolingLocked 清
+//	softStreak         ← Cooldown(CoolSoft)/CooldownSoftForModel；NoteSuccess 清（revive 保留：与余额无关）
 //	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
 //
 // 关键正交性（疑点 4 修正）：
 //   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/
 //     breakerUntil）正交：冷却管「近期被限流/余额耗尽」，熔断管「反复 5xx 失败」。
 //     disableLocked 只清冷却域、不动熔断——禁用是授权/session 终态，不应覆盖熔断观测。
-//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked 与
-//     reviveCoolingLocked（签到解冻）共用，二者对冷却域的处置因此永远一致。
+//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked 共用（禁用是
+//     终态，冷却随之作废）。reviveCoolingLocked（签到/余额刷新解冻）**不再**走全清：
+//     余额恢复只解冻余额耗尽冷却（CoolHard），软限流退避与模型级台账各有自身恢复
+//     时刻（上游重置墙钟到期/探测成功），详见 reviveCoolingLocked 注释。
 package pool
 
 import "time"
 
 // clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
 // reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// 唯一调用方是 disableLocked（禁用是终态，冷却随之作废）——reviveCoolingLocked
+// 自 upstream 602ed1b 起不再走全清（余额恢复只解冻 CoolHard），见其注释。
 // 调用方必须已持有 p.mu。
 func (e *entry) clearCoolingLocked() {
 	e.until = time.Time{}
@@ -52,15 +57,29 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	p.dirty.Store(true)
 }
 
-// reviveCoolingLocked 只清冷却域（until/coolKind/reason/softStreak/modelCooldowns）
-// 并更新 credits/creditsTotal，不动熔断器（fails/retryCount/breakerUntil）。签到解冻走这里：
-// 签到成功只证明余额恢复与 billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx
-// 信号）不应被签到覆盖。
-// softStreak 属冷却域（与 until/coolKind 同域），随冷却一并清零——与「解冻只清冷却
-// 不清熔断」的既有语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是
-// 历史软冷却累积。调用方必须已持有 p.mu。
+// reviveCoolingLocked 余额恢复解冻（签到 / 余额刷新）：更新 credits/creditsTotal，
+// 并且**只解冻余额耗尽冷却**——CoolHard 的 until/coolKind/reason。
+//
+// 为何不再走 clearCoolingLocked（upstream 602ed1b）：余额刷新周期任务（每 5 分钟）
+// 经 ReenableIfCredits 到达这里。旧实现无条件清空整个冷却域，于是
+//   - 6004 模型级台账（modelCooldowns，对齐上游重置墙钟、可长达数小时）被抹；
+//   - CoolSoft 软限流退避与 softStreak 退避计数被清零；
+//
+// 撞限号被误判健康 → 重新选中 → 再撞 429，全池冷却保护的实际寿命被压到一个刷新
+// 周期（≤5min）内（两号池实测复现：expiring==0 的号每 5 分钟被抹一次台账，
+// expiring>0 的号走 SetCreditsDetailed 幸免，两号行为不对称即根因指纹）。
+// 限流冷却的恢复证据是上游重置墙钟到期或探测成功，不是「余额有钱」；
+// softStreak 与余额无关，由 NoteSuccess（成功是最强恢复证据）或自然到期收敛。
+// 硬冷却（CoolHard）的权威恢复证据正是余额恢复（remain>0），照旧解冻。
+//
+// 熔断器（fails/retryCount/breakerUntil）一律不动：签到成功只证明余额与 billing
+// 通道健康，不证明 chat 通道健康。调用方必须已持有 p.mu。
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
 	e.creditsTotal = total
-	e.clearCoolingLocked()
+	if e.coolKind == CoolHard {
+		e.until = time.Time{}
+		e.coolKind = 0
+		e.reason = ""
+	}
 }

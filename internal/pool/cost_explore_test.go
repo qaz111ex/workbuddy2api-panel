@@ -38,6 +38,14 @@ func exploreLastLen(p *Pool) int {
 // T1（目标① 破垄断）：1 tier0 + 2 tier1（全部实际免费）、interval 极小
 // （每个窗口都探索）→ 逐号毕业，收敛后三号都被选中且 top 占比 < 70%
 // （排除 100% 垄断，3 号近均匀时期望 ~33%）。
+//
+// 稳定性：本用例原先靠 SetCostExploreInterval(time.Nanosecond) 表达「每次 pick 都探索」，
+// 但窗口判定是 `now.Sub(exploreLast) >= interval`，而本仓库已知 Windows 的 time.Now()
+// 精度有限（~0.5ms，见 pick.go minPickGap 注释）——300 次循环可能在同一个时钟刻度内
+// 跑完，`Sub` 恒为 0 < 1ns，探索只发生 0~1 次：tier1 的 n1 永远轮不到，断言
+// 「n1 从未被选中」偶发失败（实测基线 HEAD：-count=200 失败 56 次；单跑整包亦 ~10%）。
+// 这是**测试夹具依赖高精度时钟**的问题（生产 costExploreInterval 是分钟/小时级，
+// 与时钟粒度无关），故改为显式回拨窗口（同文件 T3 既有手法），语义不变且确定。
 func TestCostExploreSpreadsTrafficAcrossFreeAccounts(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
@@ -49,6 +57,7 @@ func TestCostExploreSpreadsTrafficAcrossFreeAccounts(t *testing.T) {
 
 	counts := map[string]int{}
 	for i := 0; i < 300; i++ {
+		passExploreWindow(p, "", "m") // 显式开窗：不依赖时钟刻度推进（见上方稳定性说明）
 		a := p.PickExcludingForRealm(nil, "m", "")
 		if a == nil {
 			t.Fatalf("第 %d 次 pick 返回 nil", i)

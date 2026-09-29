@@ -94,11 +94,17 @@ func (p *Pool) Revive(uid string) bool {
 	return true
 }
 
-// reviveCoolingLocked 只清冷却（until/coolKind/reason/softStreak）并更新 credits，不动熔断器
-// （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
-// billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
-// softStreak 属**冷却域**（与 until/coolKind 同域），故随冷却一并清零——与"解冻只清冷却
-// 不清熔断"的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是历史软冷却累积。
+// ReenableIfCredits 签到/余额刷新后的解冻入口：remain > 0 且账号非禁用时，把余额写回
+// （credits/creditsTotal）并解冻**余额耗尽冷却**（CoolHard 的 until/coolKind/reason）。
+// 余额恢复正是 CoolHard 的权威恢复证据。
+//
+// 不清 CoolSoft 软限流退避、softStreak 与 modelCooldowns（6004 模型级台账）：限流冷却的
+// 恢复证据是上游重置墙钟到期或探测成功，不是「余额有钱」。余额刷新周期任务每 5 分钟
+// 经本入口到达 reviveCoolingLocked——若在那里全清冷却域，任何限流冷却的实际寿命都被压到
+// 一个刷新周期（≤5min）内：6004 台账被抹后撞限号被误判健康、重新选中再撞 429，全池冷却
+// 保护形同虚设（upstream 602ed1b 两号池实测复现）。
+// 也不动熔断器（fails/retryCount/breakerUntil）：签到成功只证明余额与 billing 通道健康，
+// 不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
 // 调用方必须已持有 p.mu。
 func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
@@ -191,12 +197,30 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		if d > e.credits {
 			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
 		}
+		if d < 0 {
+			// 脏数据防御：credits 为负（手工编辑/损坏的 state.json，persist 恢复侧
+			// 只钳 expiring 不钳 credits）时，负 d 会让 credits 反向变大、并让下面的
+			// creditsExpiring -= d **膨胀**快过期桶（×8 权重项虚高）。扣减量钳到 ≥0。
+			d = 0
+		}
 		e.credits -= d
+		// 快过期桶**独立**扣减（upstream 5f6c7ca）：扣减量各自钳制，不复用会被前一级
+		// 改小的变量——复用同一变量逐级取 min 会让后面的桶被少扣。本仓库只有这一个
+		// 快过期桶（无上游的 creditsEarliest* 最早到期批次，见 SetCreditsDetailed 只有
+		// expiring 一个分桶），故等价修法 = 用独立变量 + 显式钳 0，并把「expiring 是
+		// credits 子集」这条不变式在扣减后重新钳一遍（脏数据下也不越界）。
 		if e.creditsExpiring > 0 {
-			if d > e.creditsExpiring {
-				d = e.creditsExpiring
+			dExpiring := d
+			if dExpiring > e.creditsExpiring {
+				dExpiring = e.creditsExpiring
 			}
-			e.creditsExpiring -= d
+			e.creditsExpiring -= dExpiring
+		}
+		if e.creditsExpiring > e.credits {
+			e.creditsExpiring = e.credits
+		}
+		if e.creditsExpiring < 0 {
+			e.creditsExpiring = 0
 		}
 	}
 	if e.modelCost == nil {
@@ -481,6 +505,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Disabled:          e.disabled,
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
+		CheckinDone:       e.lastCheckinDay == now.Format("2006-01-02"),
 		TokenUsage:        e.tokenUsage,
 		LastSuccessTime:   e.lastSuccess,
 		LastErrTime:       e.lastErr,
@@ -499,11 +524,28 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		st.CoolRemaining = int64(time.Until(e.until).Seconds() + 0.999)
-		if st.CoolRemaining < 0 {
-			st.CoolRemaining = 0
+		// 常规冷却（until）与熔断期（breakerUntil）**可能只有其一在生效**（upstream 5f6c7ca）：
+		// 旧实现只看 until，仅熔断期时算出负秒数被钳成 0 → 面板误报「0 秒 / unknown」，
+		// 运维看到"已到期"却选不到号。改为取仍在未来且**更晚截止**者的剩余；
+		// 熔断更晚时 CoolKind 归为 "breaker"（与 entry.fallbackKind 的兜底分类口径一致）。
+		// 用 statusOf 顶部捕获的 now 而非 time.Until：同一份状态在同一时刻算出的剩余
+		// 与 st.Cooling 的判定同源，不会出现"Cooling=true 但 remaining=0"的自相矛盾。
+		remaining := int64(0)
+		if now.Before(e.until) {
+			if r := int64(e.until.Sub(now).Seconds() + 0.999); r > remaining {
+				remaining = r
+			}
 		}
-		st.CoolKind = e.coolKind.String()
+		if now.Before(e.breakerUntil) {
+			if r := int64(e.breakerUntil.Sub(now).Seconds() + 0.999); r > remaining {
+				remaining = r
+				st.CoolKind = "breaker"
+			}
+		}
+		st.CoolRemaining = remaining
+		if st.CoolKind == "" {
+			st.CoolKind = e.coolKind.String()
+		}
 	}
 	return st
 }
