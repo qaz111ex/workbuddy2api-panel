@@ -61,6 +61,61 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, b
 	return nil, lastErr
 }
 
+// billingRetryDelays 签到/余额等维护类计费调用瞬时错误重试的退避序列：
+// 第 i 次重试前等待 billingRetryDelays[i-1]（生产 = 2s、4s，即最多补打 2 次）。
+//
+// 是切片而非两个常量，因为**跨包测试**会真的付这份等待：scheduler 的
+// TestCheckinErrorDoesNotCrash 打 500 会走签到 + 余额两条重试路径，真实退避
+// 让该用例耗时 12s+。跨包测试经 SetBillingRetryDelaysForTest 压到毫秒级
+// （upstream 包内直接改本变量）。
+var billingRetryDelays = []time.Duration{2 * time.Second, 4 * time.Second}
+
+// SetBillingRetryDelaysForTest 跨包测试钩子：替换计费维护类调用的重试退避序列，
+// 返回还原函数（调用方 `defer SetBillingRetryDelaysForTest(0)()`）。
+//
+// 传入空序列（或 nil）= 退避归零：重试次数不变，只是立即重发——用于断言
+// 「重试发生了」而不必等真实退避。生产代码不引用本函数（与 ResetLookupChainForTest
+// 同一约定：导出仅为跨包测试）。
+func SetBillingRetryDelaysForTest(d ...time.Duration) (restore func()) {
+	old := billingRetryDelays
+	billingRetryDelays = append([]time.Duration(nil), d...)
+	return func() { billingRetryDelays = old }
+}
+
+// isTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
+// 上游 5xx（ErrServer，实测偶发 "code 10000 / API request failed with status
+// code: 500"）或网络层错误（非 *Error 的传输失败）。业务错误（code!=0 的
+// 已签到/参数错、4xx、限流）不重试——重试只会原样再失败一次。
+func isTransientBillingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *Error
+	if errors.As(err, &ue) {
+		return ue.Kind == ErrServer
+	}
+	return true
+}
+
+// retryBillingTransient 对签到/余额这类低频维护调用做瞬时错误有界重试：
+// 按 billingRetryDelays 逐档退避补打（生产最多 2 次），首次成功或非瞬时错误
+// 立即返回。chat 热路径不用本策略——它有自己的换号轮转语义，重试会放大在途请求。
+func (c *Client) retryBillingTransient(fn func() error) error {
+	err := fn()
+	if err == nil || !isTransientBillingErr(err) {
+		return err
+	}
+	for _, delay := range billingRetryDelays {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		if err = fn(); err == nil || !isTransientBillingErr(err) {
+			return err
+		}
+	}
+	return err
+}
+
 // chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。
 // userId 为必填字段（= a.UID）；conversationId 由调用方生成，无需真实会话。
 type chatRequestEvent struct {

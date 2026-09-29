@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -138,6 +139,51 @@ var accountFaultMarkers = []string{
 	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
+}
+
+// contentReviewMarkers 11140「request illegal」的**内容审核**形态专属措辞（小写匹配；
+// 中文原文不受 ToLower 影响）。
+//
+// 为什么必须与账号故障分野（2026-09-28 线上事故，两个独立 fork 同日实测）：
+// 上游把两类完全不同的故障用**同一个** code 11140 + msg "request illegal" 返回——
+//   - 账号级授权封禁（真封号，需重登）；
+//   - 内容审核拒绝，真实 body 形如：
+//     {"code":11140,"msg":"request illegal","displayMsg":{
+//     "en":"The content did not pass the safety review. Please adjust and retry.",
+//     "zh":"内容未通过安全审核…"}}
+//
+// 后者是**请求级**问题（换措辞/换请求就可能通过），与账号健康无关。
+//
+// 此前 accountFaultMarkers 只匹配裸 "request illegal"，把审核形态一并吸进
+// ErrAccountFault → handler 对它 Pool.Disable **永久禁用**：一夜之间夜猫子任务的
+// 审核拒绝就误禁了 32 个凭证/余额完好的健康账号。故这里按 displayMsg 措辞分野：
+// 带审核措辞的归 ErrContentBlocked（不罚号），纯 request illegal 才是授权封禁。
+//
+// 只用 displayMsg 专属措辞，**不用** "request illegal" 本身（那是两层共用的 msg，
+// 拿它区分等于没区分）。
+var contentReviewMarkers = []string{
+	"safety review", // 覆盖 en 的 "did not pass the safety review" / "failed safety review"
+	"内容未通过安全审核",     // zh 原文
+	"未通过安全审核",       // zh 简写变体
+}
+
+// isContentReviewBlocked 报告 body 是否带内容审核形态的 displayMsg 措辞。
+func isContentReviewBlocked(lower string) bool {
+	for _, m := range contentReviewMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsContentReviewBody 报告错误 body 是否带 11140 内容审核形态的 displayMsg 措辞。
+//
+// 供 handler 侧做**防御性二道闸**（审核形态绝不 Disable）使用。刻意导出而不是让
+// handler 自己再写一份 marker：两处各写一份必然随上游措辞变化而漂移，而这里漂移的
+// 代价是「误永久禁用健康账号」，必须单一事实源。
+func IsContentReviewBody(body string) bool {
+	return isContentReviewBlocked(strings.ToLower(body))
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -348,6 +394,10 @@ func isAllDigits(s string) bool {
 // epoch 时刻而非时长：秒口径（10 位）与毫秒口径（13 位）都按「now+ 该时刻
 // 的剩余量」折算，已在过去则不可用。位数不足（8 位以下）无法判定 epoch
 // 语义的丢弃（宁缺毋滥：短串多半是序号之类的误用头）。
+//
+// 两个时长口径在**乘法之前**校验上限（吸收上游 5f6c7ca）：16 位数字乘
+// 1e9 会溢出 int64 回绕成小正数，回绕结果会骗过调用方的 retryAfterSanity
+// 校验，把畸形头当成合法等待时长——比「丢弃回落本地计算」危险得多。
 func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	// 上限 16 位防 int64 溢出（超过 epoch 毫秒的现实量级必非法）。
 	if len(v) > 16 {
@@ -359,8 +409,14 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 	switch headerName {
 	case "Retry-After":
+		if n > int64(retryAfterSanity/time.Second) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Second, true
 	case "Retry-After-Ms":
+		if n > int64(retryAfterSanity/time.Millisecond) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Millisecond, true
 	default: // X-Ratelimit-Reset：epoch → 剩余量
 		sec := n
@@ -459,6 +515,18 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(body, m) {
 			return ErrSessionDead
 		}
+	}
+	// 11140 内容审核分野：必须在 accountFaultMarkers **之前**判。
+	//
+	// 上游用同一个 code 11140 + msg "request illegal" 同时表达「账号级授权封禁」与
+	// 「内容审核拒绝」，只有 displayMsg 能区分。若让下面的 accountFault 层先命中，
+	// 审核形态会被判成账号故障 → handler Pool.Disable **永久禁用健康账号**
+	// （2026-09-28 线上事故：夜猫子任务的审核拒绝一夜误禁 32 个号）。
+	//
+	// 放在这里（而不是塞进 accountFault 循环内）是因为审核措辞可能出现在**不带**
+	// "request illegal" 的 body 里；提前独立判定两种形态都接得住。
+	if isContentReviewBlocked(lower) {
+		return ErrContentBlocked
 	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
@@ -580,7 +648,14 @@ type Client struct {
 	globalModels fetchGlobalModelsCache
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
-	SanitizeFingerprints bool
+	//
+	// 类型是 atomic.Bool 而非普通 bool（吸收上游 5f6c7ca）：面板保存配置时的热改
+	// （cmd/server 的 saveConfig → Store）与 chat 热路径的每次请求（prepareBody →
+	// Load）并发发生，普通 bool 是真实数据竞争（torn read + race detector 报警）。
+	// 换成 atomic.Bool 后该字段**不存在**任何可绕过的非原子访问途径：字段无导出
+	// 子字段，唯一入口是 Load/Store，类型系统即保证。零值 false 与原 bool 零值一致，
+	// 省略该字段的结构体字面量语义不变（只有 New() 显式 Store(true)）。
+	SanitizeFingerprints atomic.Bool
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -632,17 +707,20 @@ type Client struct {
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
 	tr := newTransport()
-	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
-		WebBaseCN:            "https://www.workbuddy.cn",
+	c := &Client{
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatBaseCN:    "https://copilot.tencent.com",
+		BillingBaseCN: "https://www.codebuddy.cn",
+		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
 	}
+	// atomic.Bool 无法在结构体字面量里赋值，默认值在这里显式落位（与改动前
+	// `SanitizeFingerprints: true` 语义逐位等价）。
+	c.SanitizeFingerprints.Store(true)
+	return c
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -747,6 +825,8 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
+//
+// 脱敏开关每次请求 Load 一次（不缓存副本）：面板热改后下一个请求立即生效。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
@@ -755,7 +835,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		// dsv4.1-flash low/high/max 生效），国际版专有模型按各自档位表（gpt-5.6-* 等）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -1689,7 +1769,9 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime 二者取有值者）。
+	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime / CycleEndTime
+	// 三者取有值者，见 CreditPackages 的取数顺序）。CN/global 实测真实下发的是
+	// CycleEndTime——只读前两者时本字段恒空，面板积分构成页到期列全为 "—"。
 	EndTime string `json:"end_time,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
@@ -1736,9 +1818,14 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
+					// 到期时间字段名在上游存在三种口径：ExpiredTime / PackageEndTime
+					// 在 CN/global 实测字段全集里均恒 miss（见 UserResourceDetailed
+					// 处注释），真实下发的是 CycleEndTime——三者都读，谁有值用谁。
+					// 此前只读前两者 → 逐包接口的 end_time 恒空，面板积分构成页到期列
+					// 全部显示 "—"（吸收上游 4466a3e）。
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
+					CycleEndTime   string `json:"CycleEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1761,10 +1848,15 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		if p.ExpiredTime != "" {
+		// 到期时刻三口径依次取非空（优先级与 UserResourceDetailed 的聚合口径对齐，
+		// 上游若将来恢复下发前两者优先级不变）。
+		switch {
+		case p.ExpiredTime != "":
 			cp.EndTime = p.ExpiredTime
-		} else {
+		case p.PackageEndTime != "":
 			cp.EndTime = p.PackageEndTime
+		default:
+			cp.EndTime = p.CycleEndTime
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
@@ -1824,7 +1916,15 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	// 余额查询同样做瞬时错误有界重试（吸收上游 dd4ea34）：签到后紧接着的
+	// user-resource 偶发 500 会让该账号错过本次解冻/到期快照更新，只能等下一个
+	// 刷新周期。业务错误（4xx/业务 code）不重试。
+	var data json.RawMessage
+	err = c.retryBillingTransient(func() error {
+		var e error
+		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+		return e
+	})
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -1926,9 +2026,13 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
+// 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
+// 让该账号整天漏签；「已签到」等业务错误不重试（吸收上游 dd4ea34）。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-	return err
+	return c.retryBillingTransient(func() error {
+		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+		return err
+	})
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。

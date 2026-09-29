@@ -35,27 +35,8 @@ func TestSchoolChatTimesEvents(t *testing.T) {
 	}
 }
 
-func TestSchoolExpertUseEvents(t *testing.T) {
-	events := SchoolExpertUseEvents("ex_x", "论文写作导师", "conv-2")
-	if len(events) != 4 {
-		t.Fatalf("events=%d want 4", len(events))
-	}
-	wantCodes := []string{"expert_summon_click", "expert_summoned", "expert_actual_use", "chat_request_send"}
-	for i, code := range wantCodes {
-		if events[i]["eventCode"] != code {
-			t.Errorf("events[%d].eventCode=%v want %s", i, events[i]["eventCode"], code)
-		}
-	}
-	if events[0]["id"] != "ex_x" || events[0]["expertTitle"] != "论文写作导师" {
-		t.Errorf("expert fields: %v", events[0])
-	}
-	if events[3]["expertId"] != "ex_x" {
-		t.Errorf("chat expertId=%v", events[3]["expertId"])
-	}
-}
-
 // TestMiniExpertUseEventMPFingerprint Sequential_Tasks_2 判据载体：mp 指纹
-// expert_actual_use——与 school 域 SchoolExpertUseEvents 是两套口径（不带
+// expert_actual_use——与（已下线的）school 域专家事件是两套口径（不带
 // conversationId/activityId、extVersion=2.2.8、type=send_message）。
 func TestMiniExpertUseEventMPFingerprint(t *testing.T) {
 	ev := MiniExpertUseEvent("ex_real001", "论文写作导师", "agent")

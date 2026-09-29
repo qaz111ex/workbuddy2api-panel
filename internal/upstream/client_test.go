@@ -75,6 +75,20 @@ func TestClassify(t *testing.T) {
 		// 防过宽反例：无 14018 业务码的 429 仍是软限流（文案不得参与判定）。
 		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
 		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
+		// 11140 内容审核分野（upstream 侧两个独立 fork 同日线上事故）：上游把
+		// 「账号级授权封禁」与「内容审核拒绝」都用 code 11140 + msg "request illegal"
+		// 返回，只有 displayMsg 能区分。审核形态是**请求级**问题，必须归
+		// ErrContentBlocked（不罚号）——判成 ErrAccountFault 会让 handler
+		// Pool.Disable 永久禁用健康账号（实测一夜误禁 32 个）。
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"en":"The content did not pass the safety review. Please adjust and retry.","zh":"内容未通过安全审核，请调整后重试"}}`, ErrContentBlocked},
+		{400, `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"内容未通过安全审核"}}`, ErrContentBlocked},
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Content failed safety review"}}`, ErrContentBlocked},
+		// 防过宽反例（**关键**）：纯 request illegal（无审核 displayMsg）必须**仍然**
+		// 是账号级授权封禁——分野不能把真封号也放过，否则该禁的号永远不会出池。
+		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		{403, `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"账号已被封禁"}}`, ErrAccountFault},
+		// 14017 不受分野影响（无审核措辞 → 仍走账号故障）。
+		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},

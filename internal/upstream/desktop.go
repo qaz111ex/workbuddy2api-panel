@@ -477,6 +477,15 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	// 从 SSE 流抓第一个 data.id 作为服务端 requestId（读干流避免残留连接）。
 	buf := make([]byte, 0, 1<<20)
 	tmp := make([]byte, 8192)
+	// searchFrom 已判定「不可能是 requestId」的位置之后的偏移：SSE 里 `"id":"` 会先
+	// 出现在每一帧的消息 id 上（chatcmpl-*），而 requestId（cmb-* / 裸 32hex）在后面
+	// 的帧里。若不推进偏移，首个不匹配的 id 会让循环永远重复命中同一位置，读满 1MB
+	// 后误报"未找到 requestId"（吸收上游 5f6c7ca）。
+	//
+	// 比上游更进一步：单次读取后**在本缓冲区内连续推进**，直到遇到一个值尚未读完的
+	// 出现位置（`"id":"` 已出现但闭合引号还没到）才停下等下一轮。上游每轮只前进一个
+	// 出现位置，若整条流一次读完（小响应/EOF 收尾），后面的真 requestId 就再也扫不到。
+	searchFrom := 0
 	for {
 		n, rerr := resp.Body.Read(tmp)
 		if n > 0 {
@@ -488,17 +497,29 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 				}
 				fmt.Printf("[dbg-rd %d] %q\n", n, dbg)
 			}
-			if i := bytes.Index(buf, []byte(`"id":"`)); i >= 0 {
-				rest := buf[i+6:]
-				if end := bytes.IndexByte(rest, '"'); end > 0 {
-					id := string(rest[:end])
-					if os.Getenv("WB2A_DEBUG_CHAT") != "" {
-						fmt.Printf("[dbg-id] %q match=%v\n", id, idRegex.MatchString(id))
-					}
-					if idRegex.MatchString(id) {
-						return conversationID, id, nil
-					}
+			for {
+				i := bytes.Index(buf[searchFrom:], []byte(`"id":"`))
+				if i < 0 {
+					break
 				}
+				abs := searchFrom + i
+				rest := buf[abs+6:]
+				end := bytes.IndexByte(rest, '"')
+				if end < 0 {
+					// 值未读完（含 `"id":""` 的闭合引号尚未到达）：原地等待下一轮读取补齐。
+					// 不能跳过——这里可能就是真 requestId。
+					searchFrom = abs
+					break
+				}
+				id := string(rest[:end])
+				if os.Getenv("WB2A_DEBUG_CHAT") != "" {
+					fmt.Printf("[dbg-id] %q match=%v\n", id, idRegex.MatchString(id))
+				}
+				if idRegex.MatchString(id) {
+					return conversationID, id, nil
+				}
+				// 完整但不匹配（含空 id）：该位置永久排除，继续在同一缓冲区内往后找。
+				searchFrom = abs + 1
 			}
 		}
 		if rerr != nil || len(buf) > 1<<20 {
