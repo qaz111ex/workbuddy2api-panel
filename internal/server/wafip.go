@@ -1,14 +1,20 @@
-// wafip.go WAF IP 级拦截 fail-fast 状态机（任务书 waf-ip-failfast）。
+// wafip.go 边缘层级拦截 fail-fast 状态机（任务书 waf-ip-failfast）。
 //
 // 背景（fork-scan-absorb T-1 / BulidH 实测）：WAF 403 拦的是网关出口 IP 而非
 // 账号——3 个账号 1 秒内全 403。既有 ErrWafBlock 账号级软冷却（wafCooldownBase
 // 起的有界退避）在 IP 级拦截时不够：轮转会把一次客户端请求放大 MaxRotate 倍，
 // 同一出口 IP 继续打上游只会加重风控。
 //
-// 判定：ErrWafBlock 基础上的短窗多号计数——wafIPWindow（60s 滑动窗）内
-// ≥ wafIPThreshold 个**不同** UID 接连命中 WAF 403 → 判定 IP 级拦截，激活至
-// now+wafIPWindow。单号反复 403（账号级偶发）永不触发：只数不同号。
-// 激活期内新命中不续期（保守：不做主动探测，窗口自然解除）。
+// 判定：短窗多号计数——wafIPWindow（60s 滑动窗）内 ≥ wafIPThreshold 个**不同**
+// UID 接连命中边缘层拒绝 → 判定出口 IP 被拦，激活至 now+wafIPWindow。单号反复
+// 命中（账号级偶发）永不触发：只数不同号。激活期内新命中不续期（保守：不做主动
+// 探测，窗口自然解除）。
+//
+// **覆盖两种同源形态**（都走 noteWaf）：
+//   - ErrWafBlock：403 + 无业务信封（APISIX WAF 拦截页/空体）
+//   - ErrEdgeAuth：401 + 无业务信封（边缘/CDN/网关鉴权拦截）——同样拦的是整批
+//     请求而非某个账号；不喂本状态机的话，一次数分钟的边缘故障会被轮转放大成
+//     「整池账号被 NoteFailures 降权」，随后全池 503。
 //
 // 归属层评估：放 server（Handler 局部）而非 pool——IP 级状态唯一消费者是
 // chatCompletions 轮转循环（是否继续轮转），pool 是账号级记账层，跨 UID 语义
@@ -41,8 +47,8 @@ type wafIPGate struct {
 	until time.Time            // IP 级拦截激活截止；零值 = 未激活
 }
 
-// noteWaf 记一次某账号的 WAF 403，返回记账后 IP 级拦截是否激活（调用方据此
-// fail-fast 终止轮转，优先于 rotateBackoff 退避）。
+// noteWaf 记一次某账号的边缘层拒绝（WAF 403 或边缘 401），返回记账后 IP 级拦截是否
+// 激活（调用方据此 fail-fast 终止轮转，优先于 rotateBackoff 退避）。
 //   - 已激活（now < until）：不续期、不记账（窗口期内不重置——保守自然解除）→ true；
 //   - 未激活：记 hits[uid]=now（同号重复命中覆盖不累计，判定口径是「不同号数」），
 //     剪掉窗外的过期命中；不同 UID 数达 wafIPThreshold → 激活到 now+wafIPWindow
@@ -65,7 +71,7 @@ func (g *wafIPGate) noteWaf(uid string) bool {
 	}
 	if len(g.hits) >= wafIPThreshold {
 		g.until = now.Add(wafIPWindow)
-		log.Printf("WARN: [server] waf ip-level block: %d accounts hit waf 403 within %s, rotate fail-fast until %s", len(g.hits), wafIPWindow, g.until.Format(time.RFC3339))
+		log.Printf("WARN: [server] edge ip-level block: %d accounts hit edge rejection (waf 403 / edge 401) within %s, rotate fail-fast until %s", len(g.hits), wafIPWindow, g.until.Format(time.RFC3339))
 		g.hits = map[string]time.Time{}
 		return true
 	}

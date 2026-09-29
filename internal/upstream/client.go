@@ -39,6 +39,7 @@ const (
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
+	ErrEdgeAuth                      // 401 + 非业务信封体（边缘/CDN/网关鉴权拦截）→ **不罚账号**，IP 级 fail-fast
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效（400 + 11135 等）→ 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
@@ -64,6 +65,8 @@ func (k ErrKind) String() string {
 		return "model_blocked"
 	case ErrWafBlock:
 		return "waf_block"
+	case ErrEdgeAuth:
+		return "edge_auth"
 	case ErrPromptTooLong:
 		return "prompt_too_long"
 	case ErrImageInvalid:
@@ -342,6 +345,23 @@ func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
 }
 
+// IsEdgeAuthFailure 报告 401 响应是否为**边缘层**（CDN / 网关 / WAF）鉴权拦截形态：
+// HTTP 401 且 body 无业务信封（无 `"code":`/`"msg":` JSON 字段——HTML 拦截页、空体、
+// 纯文本均命中）。
+//
+// 为什么必须与「session 失效」分开（2026-09 实测）：边缘层鉴权拦截**与账号无关**——
+// 同一批 token 在拦截窗口内全部 401，窗口过后同样的 token 立刻 200（对照实验）。
+// 若落进通用 4xx 兜底（ErrClient），`applyErrorPolicy` 会对每个命中账号喂连败计数
+// `NoteFailures` → 连续 N 次**临时出池**：一次 5 分钟的边缘故障就能把整池健康账号
+// 降权一遍（实测 33 个号被降权），随后 503——**把基础设施故障记在账号头上**，
+// 与本项目对 WAF 403 的既有判断（IP/指纹维，非账号维）完全同类。
+//
+// 判别口径与 IsWafBlocked 对称：只有「无业务信封」才判边缘层。带信封的 401 走既有
+// 分类链（12153 → ErrSessionDead 等）——那种是账号/session 的真实状态，不能放过。
+func IsEdgeAuthFailure(status int, body string) bool {
+	return status == http.StatusUnauthorized && !hasBusinessEnvelope(body)
+}
+
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列：
 // retry-after（秒，RFC 7231）/ retry-after-ms（毫秒）/ x-ratelimit-reset
 // （epoch 秒或毫秒，取 now+ 剩余量）。大小写不敏感（http.Header.Get 已归一）。
@@ -490,6 +510,10 @@ func ParseRateReset(body string) (time.Time, bool) {
 //  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
+//     10b. IsEdgeAuthFailure —— 401 且无业务信封（边缘/CDN/网关鉴权拦截页）：与上一条
+//     同源的「边缘拒绝整批请求」形态。判在通用 4xx 兜底之前：落 ErrClient 会让每个
+//     命中账号被喂连败计数并临时出池，一次数分钟的边缘故障即可降权整池健康账号。
+//     带信封的 401（12153 等）已在第 2 层 sessionDead 权威分类，不受影响。
 //  11. 图片请求无效 —— 400 且 body 命中图片错误族（isImageInvalidBody：11135
 //     codeMarker 口径 ∪ `invalid image_url content` 文案族）：确定性的请求级错误，
 //     同 body 换账号结果不变，判在内容策略/参数错误之前直接 fail-fast（见 handler
@@ -581,6 +605,13 @@ func Classify(status int, body string) ErrKind {
 	// 带信封的 403 在上方各层已有权威分类，不受影响。
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock
+	}
+	// 边缘层 401（无业务信封的鉴权拦截形态）：与 WAF 403 同源同判——都是「边缘拒绝
+	// 了整批请求」而非账号失效。判在通用 4xx 兜底之前：落 ErrClient 的代价是每个命中
+	// 账号都被喂连败计数、连续 N 次临时出池，一次数分钟的边缘故障就能把整池健康账号
+	// 降权一遍。带信封的 401（12153 等）在上方 sessionDead 层已有权威分类，不受影响。
+	if IsEdgeAuthFailure(status, body) {
+		return ErrEdgeAuth
 	}
 	// 图片格式/数据错误（HTTP 400）是确定性的请求级错误：同 body 换账号结果不变，
 	// 直接 fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。

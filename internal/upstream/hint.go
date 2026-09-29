@@ -51,6 +51,11 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。
 		return "upstream WAF blocked the gateway; retry after the block window"
+	case ErrEdgeAuth:
+		// 边缘层 401（无业务信封）：与 WAF 同源——拦的是网关出口而非账号，客户端的
+		// 动作同样是「等窗口过去再试」。刻意**不**提示「检查 API key」：那是把基础
+		// 设施拦截误报成用户凭证问题，会让人去改一个本来正确的 key。
+		return "upstream edge layer rejected the gateway (not an account or credential problem); retry after the block window"
 	case ErrSoftRate:
 		return "rate limited by upstream; retry after reset"
 	case ErrAccountFault:

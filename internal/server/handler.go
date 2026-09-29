@@ -993,11 +993,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
-			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
-			// 该次 WAF 403 喂入 IP 级状态机，若激活（短窗多号命中，IP 被拦而非账号）
-			// 则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍打同一出口 IP，
-			// 加重风控。账号级软冷却已在上方 applyErrorPolicy 照常记账。
-			if kind == upstream.ErrWafBlock && h.wafIP.noteWaf(acct.UID) {
+			// IP 级 fail-fast（优先于 rotateBackoff 退避——IP/边缘级拦截时退避无意义）：
+			// 该次命中喂入 IP 级状态机，若激活（短窗多号命中，说明被拦的是出口 IP
+			// 而非某个账号）则立即终止轮转——继续换号只会把请求放大 MaxRotate 倍打
+			// 同一个出口，加重风控。账号级处置已在上方 applyErrorPolicy 照常记账。
+			//
+			// 覆盖两种同源形态：
+			//   - ErrWafBlock：403 + 无业务信封（APISIX WAF 拦截页）
+			//   - ErrEdgeAuth：401 + 无业务信封（边缘/CDN/网关鉴权拦截）——不喂状态机
+			//     的话，一次边缘故障会被轮转放大成整池降权（详见 applyErrorPolicy 注释）
+			if (kind == upstream.ErrWafBlock || kind == upstream.ErrEdgeAuth) && h.wafIP.noteWaf(acct.UID) {
 				break
 			}
 			if !rotateBackoff(i, r.Context()) {
@@ -1241,6 +1246,22 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			return
 		}
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
+	case upstream.ErrEdgeAuth:
+		// 边缘层 401（无业务信封的鉴权拦截）：**零账号处置**——不冷却、不熔断、
+		// 不 NoteError、不喂连败计数。理由是归属：边缘（CDN/网关/WAF）拦截的是
+		// **整批请求**，与账号健康无关（实测：同一批 token 在拦截窗口内全 401，
+		// 窗口过后立刻 200）。此前该形态落 ErrClient → 每个命中账号被 NoteFailures
+		// 喂连败 → 连续 N 次临时出池：一次 5 分钟的边缘故障就能把整池健康账号降权
+		// 一遍，随后全池 503。
+		//
+		// 与 ErrContentBlocked 同待遇（零动作）。IP 级 fail-fast 由 chatCompletions
+		// 轮转循环喂 h.wafIP 状态机负责（见那里的注释）——**不在这里**做，因为
+		// 是否继续轮转是循环的决策，不是账号记账的决策。
+		//
+		// 注：本 case 是「把处置意图写明」（与 ErrPromptTooLong/ErrImageInvalid 两处
+		// 同理）。实测删掉它后 ErrEdgeAuth 落 default 也不会被罚（default 只对
+		// ErrClient 喂连败），故**真正承载修复的是 Classify 的分野**；这里显式列出
+		// 是为了让「零处置」成为契约而非巧合，避免日后被接进某条惩罚路径。
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:
