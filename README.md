@@ -131,6 +131,42 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 成长中心连登档位（连续登录 7/14/28 天）兑换后发放积分 / 能量 / 补签卡 / **抽奖次数**，抽奖次数只能从兑换获得。网关把它挂在每日签到排程末尾自动跑闭环（见[定时任务](#定时任务)）：档位解锁当天自动兑换、有抽奖次数自动抽完，全程无需人工盯。
 
+## 🔌 协议兼容（Anthropic Messages / OpenAI Responses）
+
+除了 OpenAI Chat Completions，网关还直接说两种**别的协议**——客户端按自己的原生协议接入，不需要任何转换中间层：
+
+| 端点 | 协议 | 典型客户端 |
+|---|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions | opencode、各类 OpenAI SDK |
+| `POST /v1/messages` | **Anthropic Messages** | **Claude Code**、Anthropic SDK |
+| `POST /v1/messages/count_tokens` | Anthropic token 估算 | Claude Code（上下文预算提示） |
+| `POST /v1/responses` | **OpenAI Responses** | 使用 Responses API 的客户端 |
+
+三种协议走的是**同一条账号管线**（选号/轮转/粘性/熔断/冷却/跨域回落/错误分类/用量记账），差别只在入站请求与出站响应的**翻译**——所以账号保护规则、错误 `gateway_hint`、限流与冷却语义在三种入口下完全一致。
+
+### 把 Claude Code 接到本网关
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:7863"     # 你的网关地址
+export ANTHROPIC_AUTH_TOKEN="<你的 api_key>"
+# ⚠️ 必须指定模型名：见下方「已知限制」
+export ANTHROPIC_MODEL="deepseek-v4.1-flash"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4.1-flash"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="deepseek-v4.1-flash"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4.1-flash"
+```
+
+模型名可带 `cn:` / `global:` 前缀指定账号域（与 `/v1/chat/completions` 同口径），也可用裸名走默认域 + 跨域回落。
+
+### 已知限制（如实列出，避免踩坑）
+
+- **Anthropic 原生模型名（`claude-*`）不会自动替换**：必须按上面的方式把模型名设成网关目录里的模型。自动替换需要 `anthropic.default_model` 配置项（尚未提供）。
+- **`count_tokens` 是估算**（ASCII/4 + 非 ASCII×1 + 每条消息 4），不是上游计费口径，仅供客户端做数量级提示。
+- **thinking / redacted_thinking 内容块不回传**：Anthropic 的 thinking 块必须带 `signature`，网关无法合成（伪造会被严格客户端拒绝）。请求侧的 thinking 预算会映射成 reasoning effort。
+- **未支持**：Anthropic 的 `document`(PDF) 块、服务端工具（`web_search_*`）、`top_k`；Responses 的 `previous_response_id`/`store`/`include`/结构化输出 `text.format`。这些在上游 chat 协议里没有等价物，代码中有显式分支，**不会静默丢弃**。
+- `metadata.user_id` **有意不转发**：本仓库契约是「带 user_id 的请求抑制派生粘性键」，转发会让只发 user_id 的客户端（如 Claude Code）彻底失去按会话粘号；丢弃后由 system + 首条 user 消息派生会话级粘性。
+- 流式响应头**延迟到首个翻译事件**才写出：好处是「首 token 之前的任何上游错误仍能返回正确的 HTTP 状态码 + JSON 错误体」；代价是响应头与首帧对齐（不提前）。
+
 ## 🆚 与上游的差异
 
 本分支相对 [上游 master](https://github.com/Sliverkiss/workbuddy2api) 的增量（均已在真实多账号环境验证）：
@@ -343,7 +379,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `listen` | `:7863` | HTTP 监听地址 |
-| `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
+| `api_key` | 空 | **数据面**（`/v1/*`）鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置）。它必须填给客户端（opencode / Claude Code / 各类 SDK），因此不要把它当作管理凭证 |
+| `panel_key` | 空 | **管理面**（`/panel/*`）独立鉴权密钥。非空 = 面板**只**认它，数据面 `api_key` 打不开面板；空 = 回落复用 `api_key`（向后兼容，启动日志会告警）。**强烈建议设置**：见下方[为什么建议分离](#为什么建议把面板密钥独立出来) |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `shutdown_grace_seconds` | `5` | 收到 SIGINT/SIGTERM 后等待**在途请求自然结束**的上限秒数。★ 网关以**长流式 SSE** 为主负载，一次生成合法可达数分钟；默认 5s 会掐断大多数在途流，想真正保住就调大（如 `120`）。调大的代价是停机变慢（最坏等满该值）。`<=0` 回落 5 |
@@ -397,7 +434,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_PANEL_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
 ## 核心行为语义
 
@@ -571,7 +608,26 @@ curl -s http://localhost:7863/v1/chat/completions \
 http://127.0.0.1:7863/panel/
 ```
 
-鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
+鉴权用**管理面密钥**：设置了 `panel_key` 时面板只认它（浏览器 localStorage 记住，输入一次即可）；
+未设置 `panel_key` 时回落复用 `api_key`（与历史行为一致，启动日志会提示建议设置）；
+两个 key 都为空则不鉴权、直接可用。数据面 `/v1/*` **恒只认 `api_key`**，两个方向严格分离。
+
+### 为什么建议把面板密钥独立出来
+
+`api_key` 是**必须交给客户端**的数据面凭证——opencode、Claude Code、各类 SDK 都要填，也就意味着它会出现在
+客户端配置、聊天记录、日志和截图里。如果它同时是面板的管理凭证，那么**任何拿到你数据面 key 的人都能打开面板**：
+`/panel/api/overview` 会吐出整个账号池（每个账号的 uid、昵称、余额、套餐、到期、限流状态），
+面板端点还能改动账号池与配置（改冷却、禁用/复活账号、改 `api_key` 本身）。
+
+设置一个独立的 `panel_key`（只自己保留、不外发）即可把管理权与数据面凭证解耦：
+
+```json
+{ "api_key": "sk-...客户端填这个...", "panel_key": "只有你自己知道的另一串" }
+```
+
+`panel_key` 支持热改：在面板配置页填写并保存后，下一个请求立即按新值判定，无需重启。
+面板配置页读取的接口本身也在 `/panel/api/*` 鉴权之后，未鉴权请求拿不到任何配置内容（含 `panel_key` 明文）。
+
 界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分四个视图：
 
 | 视图 | 功能 |
@@ -580,10 +636,10 @@ http://127.0.0.1:7863/panel/
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
-| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
+| **配置** | 在线编辑 config.json：API 密钥（数据面）、面板密钥（管理面）、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
 | **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
 
-**配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
+**配置热生效**：保存配置后，`api_key`、`panel_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
@@ -753,6 +809,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 ### 2. 网络暴露与日志敏感度
 
 - 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
+- **管理面与数据面密钥分离**：`api_key` 必须外发给客户端，设置独立的 `panel_key` 可避免"数据面 key = 账号池管理权"（详见 [为什么建议把面板密钥独立出来](#为什么建议把面板密钥独立出来)）；未设置时面板回落复用 `api_key`，启动日志会告警
 - 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
 
