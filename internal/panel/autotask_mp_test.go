@@ -149,12 +149,20 @@ func newMPPanel(t *testing.T, s *mpStub) (*Panel, *auth.Auth) {
 	return &Panel{cfg: Config{Upstream: c}}, &auth.Auth{AccessToken: "at", UID: "u-1", Nickname: "测试"}
 }
 
-// fastPoll 把异步计分的轮询间隔压到毫秒级（默认 3s×2 轮会让测试慢 6s）。
+// fastPoll 把异步计分的轮询间隔压到毫秒级（默认 3s×2 轮会让测试慢 6s），并把
+// 对话事件的真人节奏间隔（mpChatEventGap 45s + 0~10s 抖动）一并压掉——否则
+// Tasks_3/6 的多条补报会把用例拖到分钟级。**节奏本身**由
+// autotask_mp_pace_test.go 用「上报时间戳间隔」单独断言，不在这里失守。
 func fastPoll(t *testing.T) {
 	t.Helper()
 	oldGap, oldMP := claimPollGap, mpActionGap
+	oldChat, oldJitter := mpChatEventGap, mpChatEventJitter
 	claimPollGap, mpActionGap = time.Millisecond, time.Millisecond
-	t.Cleanup(func() { claimPollGap, mpActionGap = oldGap, oldMP })
+	mpChatEventGap, mpChatEventJitter = time.Millisecond, 0
+	t.Cleanup(func() {
+		claimPollGap, mpActionGap = oldGap, oldMP
+		mpChatEventGap, mpChatEventJitter = oldChat, oldJitter
+	})
 }
 
 // TestRunMPMiniChatTaskUsesPostAcceptAuthoritativeTarget accept 后回读的独立证据：
