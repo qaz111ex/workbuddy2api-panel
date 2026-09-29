@@ -177,6 +177,15 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptCacheHitTokens   int `json:"prompt_cache_hit_tokens"`
 			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
 			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
+			// 兼容别名（与 upstream.normalizeUsageCacheAliases 同口径）：部分上游把
+			// **真实**命中量放在嵌套明细里（prompt_tokens_details.cached_tokens），
+			// 同时把顶层 prompt_cache_hit_tokens 留为 0。只认顶层会让**流式**请求的
+			// 命中率恒为 0（非流式走 Aggregate 已被别名统一修好），面板显示错误。
+			// 指针用于区分「显式 0」与「字段缺席」。
+			PromptTokensDetails  *usageCachedDetails `json:"prompt_tokens_details"`
+			InputTokensDetails   *usageCachedDetails `json:"input_tokens_details"`
+			CacheReadInputTokens *int                `json:"cache_read_input_tokens"`
+			CachedTokens         *int                `json:"cached_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -198,9 +207,53 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
 	}
-	s.cacheHit = chunk.Usage.PromptCacheHitTokens
+	// 命中量按 upstream.bestUsageCacheHitTokens 的**同一优先级**取：
+	// 嵌套明细优先，其次顶层三别名，最后 Responses 形态的 input_tokens_details。
+	// 顺序必须与非流式一致，否则同一请求流式/非流式会算出两套命中率。
+	s.cacheHit = firstPositive(
+		usageCachedOf(chunk.Usage.PromptTokensDetails),
+		chunk.Usage.PromptCacheHitTokens,
+		usageIntOf(chunk.Usage.CacheReadInputTokens),
+		usageIntOf(chunk.Usage.CachedTokens),
+		usageCachedOf(chunk.Usage.InputTokensDetails),
+	)
 	s.cacheMiss = chunk.Usage.PromptCacheMissTokens
 	s.cacheWr = chunk.Usage.PromptCacheWriteTokens
+}
+
+// usageCachedDetails 嵌套缓存明细：prompt_tokens_details 与 input_tokens_details
+// 同形（都只取 cached_tokens），故共用一个具名类型（匿名 struct 的类型身份含字段
+// 标签，两处各写一份会变成不同类型，无法复用取值函数）。
+type usageCachedDetails struct {
+	CachedTokens *int `json:"cached_tokens"`
+}
+
+// usageCachedOf 取嵌套明细的命中量；明细或字段缺席返回 0。
+func usageCachedOf(d *usageCachedDetails) int {
+	if d == nil || d.CachedTokens == nil {
+		return 0
+	}
+	return *d.CachedTokens
+}
+
+// usageIntOf 取可空顶层别名的值；缺席返回 0。
+func usageIntOf(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+// firstPositive 返回第一个 > 0 的值；全为 0 时返回 0。
+// 用「正值优先」而非「非零优先」：缓存计数无负数语义，且 0 表示「未命中」——
+// 让显式 0 的顶层别名盖掉嵌套里的真实值，正是要修的那个 bug。
+func firstPositive(vals ...int) int {
+	for _, v := range vals {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。

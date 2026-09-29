@@ -1253,11 +1253,24 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+		//
+		// 第二道闸（防御性，2026-09-28 线上事故的正面教训）：11140 同时承载
+		// **内容审核拒绝**（displayMsg "内容未通过安全审核"/"safety review"），那是
+		// 请求级问题，绝不能被禁用。Classify 已在 accountFault 层之前按 displayMsg
+		// 分野，正常不会把审核形态送到这里；此处再拦一道，是为了「万一上游换了
+		// 措辞/多包了一层/分类被绕过」时失效方向是**少禁号**而不是**多禁号**——
+		// 误禁用是不可逆的（需人工重登），误冷却只是短暂少一个号。宁可保守。
 		if strings.Contains(strings.ToLower(body), "request illegal") {
+			if upstream.IsContentReviewBody(body) {
+				h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "content review rejection (11140, not an account ban)")
+				return
+			}
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
+		// 基数走 h.softCooldown()（热改优先）：面板改 soft_rate 后 14017 路径必须
+		// 立即生效——读 h.cfg.SoftCooldown 会停在启动值，与 429/6004 路径口径不一。
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
