@@ -22,6 +22,13 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
+	// ShutdownGraceSeconds 收到 SIGINT/SIGTERM 后，等待在途请求自然结束的上限秒数。
+	//
+	// 为什么需要它：进程退出前必须先排空在途请求（尤其是**长流式 SSE**，一次生成
+	// 合法可达数分钟）。默认 5s 是历史值——对 SSE 为主负载的网关偏短，长流仍会被
+	// 掐断；想真正保住在途流就调大（如 120）。调大的代价是停机变慢（最坏等满该值）。
+	ShutdownGraceSeconds int `json:"shutdown_grace_seconds"`
+
 	// server.max_body_mb 与 WB2A_MAX_BODY_MB 已**彻底移除**（不再读取、不再生效）。
 	//
 	// 移除理由：字节上限与上游的真实限制不对应。上游限制在 **token** 而非字节
@@ -482,6 +489,11 @@ func (c *Config) normalize() error {
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	// 优雅停机上限：<=0（含键缺席时的零值）回落 5s。语义唯一——「想等多久」，
+	// 不存在 0 表示「不等待」的说法（不等待的优雅停机本身是自相矛盾的）。
+	if c.ShutdownGraceSeconds <= 0 {
+		c.ShutdownGraceSeconds = 5
 	}
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。

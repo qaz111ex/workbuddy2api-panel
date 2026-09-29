@@ -3,6 +3,7 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "shutdown_grace_seconds": 5,
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"

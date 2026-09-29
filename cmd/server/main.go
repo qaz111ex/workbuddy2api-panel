@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.14.0-panel"
+const appVersion = "1.15.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -146,7 +147,7 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
-	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -300,19 +301,48 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	ln, lerr := net.Listen("tcp", cfg.Listen)
+	if lerr != nil {
+		log.Fatalf("listen %s: %v", cfg.Listen, lerr)
+	}
+	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	if err := serveUntilShutdown(srv, ln, ctx, time.Duration(cfg.ShutdownGraceSeconds)*time.Second, p.Flush); err != nil {
+		log.Fatalf("http: %v", err)
+	}
+	log.Printf("bye")
+}
+
+// serveUntilShutdown 用一个已就绪的监听器服务请求，收到 ctx 取消（SIGINT/SIGTERM）
+// 后**等待在途请求全部排空**再返回。
+//
+// 为什么必须显式等：srv.Shutdown 一旦被调用，srv.Serve/ListenAndServe 就立刻返回
+// http.ErrServerClosed——**不是**等排空结束才返回。若调用方在此刻直接 return，
+// 进程会在 Shutdown 还在排空时退出，优雅停机等于没做（正在生成的 SSE 流被掐断，
+// 且与调用方的其它清理路径竞争）。故这里用 shutdownDone 显式同步。
+//
+// onSignal 在排空开始前调用（用于落盘等"先持久化再停机"的动作），可为 nil。
+// 不会死等：Shutdown 受 grace 限时，超时即返回（ctx.Err()），届时照常关闭 shutdownDone。
+func serveUntilShutdown(srv *http.Server, ln net.Listener, ctx context.Context, grace time.Duration, onSignal func()) error {
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if onSignal != nil {
+			onSignal()
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+	err := srv.Serve(ln)
+	if err != nil && err != http.ErrServerClosed {
+		return err
 	}
-	log.Printf("bye")
+	// 等排空结束再返回。ErrServerClosed 只可能来自本函数的 srv.Shutdown，
+	// 故此处必然等到 close（且 Shutdown 自身受 grace 限时，不会无限等）。
+	<-shutdownDone
+	return nil
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
@@ -411,7 +441,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RealmFallback:        newCfg.Global.RealmFallback,
 	})
-	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
+	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
