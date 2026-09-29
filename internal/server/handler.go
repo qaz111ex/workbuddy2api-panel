@@ -1350,10 +1350,34 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
-			"type":    "api_error",
+			"type":    openAIErrType(status),
 			"code":    code,
 		},
 	})
+}
+
+// openAIErrType 把 HTTP 状态码映射到 OpenAI 惯例的 error.type。
+//
+// 为什么不能恒为 "api_error"（此前的写法）：OpenAI 的分类里 `api_error` 表示
+// **服务端**故障，而 4xx 是**客户端**错误，惯例是 `invalid_request_error`
+// （401 的典型响应即 `type: "invalid_request_error"` + `code: "invalid_api_key"`）。
+// 恒用 api_error 有实际后果：按 `type` 决定「是否重试」的客户端会把**不该重试**的
+// 4xx（含 429 之外的参数错误）当成服务端故障反复重试；而 5xx 仍是 api_error，
+// 「该重试」的判断不受影响——所以这是严格改好。
+//
+// 口径与 Anthropic 侧 anthropicErrType 对齐（只是分类名按各家惯例）：
+// 401/403/404 → invalid_request_error（OpenAI 不细分认证类，用 code 区分）、
+// 429 → rate_limit_error、413 → invalid_request_error（OpenAI 无 request_too_large
+// 这一 type）、其余 4xx → invalid_request_error、5xx → api_error。
+func openAIErrType(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case status >= 400 && status < 500:
+		return "invalid_request_error"
+	default:
+		return "api_error"
+	}
 }
 
 // wafCooldownBase WAF 403 软冷却基数（建议 60s 起；抖动 ±25% 后落 [45s,75s]，
@@ -1374,7 +1398,7 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message":      msg,
-			"type":         "api_error",
+			"type":         openAIErrType(status), // 与 writeOpenAIError 同口径（勿写死 api_error，否则带 hint 与不带 hint 会变成两套口径）
 			"code":         code,
 			"gateway_hint": hint,
 		},
