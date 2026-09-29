@@ -253,6 +253,44 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 	}
 }
 
+// TestRunCheckinMarksCheckinDone 签到成功与上游「今天已签到」幂等拒绝都要把
+// 「今日已签」落到池状态：面板签到按钮据此显示 签到/已签（dd4ea34 的 scheduler 接线）。
+func TestRunCheckinMarksCheckinDone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"首次成功", `{"code":0,"msg":"ok","data":{}}`},
+		{"幂等已签", `{"code":14001,"msg":"今天已签到"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := tc.body
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
+					w.Write([]byte(body))
+				case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+					w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":100,"CycleCapacityUsed":0}]}}}}`))
+				default:
+					http.Error(w, "not found", 404)
+				}
+			}))
+			defer srv.Close()
+
+			p := pool.New("")
+			p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+			up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+			s := New(Config{Pool: p, Upstream: up})
+			s.RunCheckinNow()
+
+			st, _ := p.Status("u1")
+			if !st.CheckinDone {
+				t.Errorf("签到后 Status.CheckinDone=false want true: %+v", st)
+			}
+		})
+	}
+}
+
 func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 	f := &fakeUpstream{}
 	srv := f.server()
@@ -357,6 +395,9 @@ func TestRunKeepaliveSessionDeadResetBySuccess(t *testing.T) {
 }
 
 func TestCheckinErrorDoesNotCrash(t *testing.T) {
+	// 签到与随后的余额查询都会对 5xx 做有界重试（生产退避 2s + 4s，两条路径共 12s+）。
+	// 本用例只关心「上游报错不 crash」，不需要付真实退避：压到 0（重试次数与语义不变）。
+	defer upstream.SetBillingRetryDelaysForTest(0)()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
 		w.Write([]byte(`boom`))

@@ -235,6 +235,87 @@ func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
 	return sleepCtx(ctx, wakeupGraceDelay)
 }
 
+// wallclockCheckStep 墙钟校验段长：等待槽位时单次 timer 的最大时长，每段醒来用
+// 墙钟重判是否到点。值是「时点精度」与「空闲唤醒频率」的折中——60s 段内时点
+// 偏差上限 60s，对签到/保活类任务足够。
+const wallclockCheckStep = time.Minute
+
+// slotWake waitSlot 的三态结果。
+type slotWake int
+
+const (
+	slotFired  slotWake = iota // 墙钟已到达计划时点：补跑本批
+	slotRearm                  // 排程已变（Reconfigure）：上层重算下一次唤醒
+	slotCancel                 // ctx 取消：上层优雅退出
+)
+
+// wallclockNow waitSlot 的墙钟读数源（生产为 time.Now）。每段醒来用它重判是否到点：
+// next 由 nextFire 的 time.Date 构造、不携带单调读数，故 next.Sub(wallclockNow()) 是
+// 纯墙钟差（睡眠期间墙钟照常前进，判据不落段）。
+//
+// 声明为变量是 waitSlot 的**测试接缝——勿精简成直接的 time.Now() 调用**。
+// 为什么非有不可：本修复的靶子是「单调时钟被系统睡眠冻结」，它在真实时钟下无法复现；
+// 而全部走真实时钟时，「分段 + 每段墙钟重判」与「一次性 time.NewTimer(time.Until(next))」
+// 在可观测层面完全重合（目标已过点两者都立即返回，目标未到两者都在计划时点返回）——
+// scheduler_wait_test.go 里除 TestWaitSlotWallclockRecheckAfterFrozenMonotonic 之外的
+// 用例，对**回退成一次性等待的实现同样通过**。只有注入时钟（墙钟照常前进、段计时器按
+// 单调时钟"少睡"）才能让落点从「计划时点」变成「计划时点 + 睡眠时长」而证伪。
+// 删掉这个变量 = 删掉墙钟修复唯一的证伪手段。生产路径零差异。
+var wallclockNow = time.Now
+
+// slotSegment waitSlot 的单段等待（生产为 time.NewTimer）：返回段到期 channel 与停止
+// 函数；ctx 取消 / rearm 两条提前返回路径都调用停止函数释放 timer（不泄漏）。
+//
+// 同样是**测试接缝——勿精简成直接的 time.NewTimer 调用**：测试靠它模拟「段计时器被
+// 系统睡眠冻结」（该段按单调时钟等满 d，而墙钟额外前进了睡眠时长），从而让
+// TestWaitSlotWallclockRecheckAfterFrozenMonotonic 能区分分段实现与一次性实现。
+// 生产路径零差异。
+var slotSegment = func(d time.Duration) (<-chan time.Time, func()) {
+	t := time.NewTimer(d)
+	return t.C, func() { t.Stop() }
+}
+
+// waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFire 用 time.Date 构造、
+// 不携带单调读数，next.Sub(墙钟) 对它是纯墙钟差）。
+//
+// 为什么不一把 time.NewTimer(time.Until(next)) 睡到底：timer 的等待基于单调时钟，
+// macOS / Windows Modern Standby 睡眠会冻结它——睡眠时长不足整个等待时，fire
+// 被顺延「睡眠时长」（墙钟已过点、timer 还要继续等），时点被错过且不会立即补跑；
+// 睡眠时长超过整个等待时倒是无害的（唤醒瞬间 timer 到期，awaitWakeupGrace 补跑）。
+// 分段睡、每段醒来用墙钟重判，把冻结的影响限制在一段之内：睡眠结束后的第一段
+// 末尾必然发现「墙钟已越过时点」并立即补跑，偏差上限 = 段长 + 睡眠落段余量。
+//
+// ctx 取消 / rearmSchedule（在线改配置重排）在每段的 select 里随时返回，段长
+// 不影响两者响应性。返回三态见 slotWake。
+func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Duration) slotWake {
+	if step <= 0 {
+		// 防御：step<=0 会让每段 timer 立即到期而墙钟仍未到点 → 忙等空转。
+		step = wallclockCheckStep
+	}
+	for {
+		wallRemain := next.Sub(wallclockNow())
+		if wallRemain <= 0 {
+			return slotFired
+		}
+		d := wallRemain
+		if d > step {
+			d = step
+		}
+		seg, stop := slotSegment(d)
+		select {
+		case <-ctx.Done():
+			stop()
+			return slotCancel
+		case <-s.rearmSchedule:
+			stop()
+			return slotRearm
+		case <-seg:
+			// 段末回到循环顶用墙钟重判：正常推进时若干段后到点；单调时钟被
+			// 睡眠冻结时，墙钟大幅前进，至多一段之后即到点补跑。
+		}
+	}
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
@@ -249,14 +330,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 		}
-		timer := time.NewTimer(time.Until(next))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		switch s.waitSlot(ctx, next, wallclockCheckStep) {
+		case slotCancel:
 			return
-		case <-s.rearmSchedule:
-			timer.Stop() // 排程已变：重算下一次唤醒
-		case <-timer.C:
+		case slotRearm:
+			continue // 排程已变：重算下一次唤醒
+		case slotFired:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
 			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
@@ -337,11 +416,17 @@ func (s *Scheduler) RunCheckinNow() {
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
+				s.cfg.Pool.NoteCheckinDone(st.UID)
 				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
 			} else {
 				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			}
 			// 其余业务错误也继续走余额查询
+		} else {
+			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+			// 重复触发时出现），成功也落一行。
+			s.cfg.Pool.NoteCheckinDone(st.UID)
+			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
@@ -356,7 +441,6 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 	}
 	s.RunStreakBonusNow()
-	s.RunSchoolNow() // 开学季活动（活动期 9/13-9/24，结束自动跳过）
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
