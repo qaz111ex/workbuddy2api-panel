@@ -356,10 +356,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 // ctx 取消时由各任务内部的可取消等待快速收尾。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 	var wg sync.WaitGroup
-	for _, k := range kinds {
+	for idx, k := range kinds {
 		wg.Add(1)
-		go func(k taskKind) {
+		go func(k taskKind, idx int) {
 			defer wg.Done()
+			// 同槽位多任务族**错开启动**（见 familyStagger 注释）：各族都是
+			// 「逐账号 + 800ms 限速」的同一节奏，同时启动会锁步推进，导致每个账号
+			// 在同一瞬间被两个族各打一次。确定性偏移一次即永久错开。
+			if idx > 0 && !sleepCtx(ctx, time.Duration(idx)*familyStagger) {
+				return // ctx 取消：不启动本族（优雅停机不必等错开睡醒）
+			}
 			switch k {
 			case taskCheckin:
 				s.RunCheckinNow()
@@ -372,10 +378,27 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			case taskBlackcat:
 				s.RunBlackcatNow()
 			}
-		}(k)
+		}(k, idx)
 	}
 	wg.Wait()
 }
+
+// familyStagger 同一槽位内多个任务族之间的启动错开量。
+//
+// 为什么必须错开（真实缺陷，且**默认配置就命中**）：runBatch 给每个任务族各起一个
+// goroutine **并发**执行，而每个族都是「逐账号 + activityAccountDelay(800ms) 限速」
+// 的**同一节奏**——同时启动会让它们**锁步推进**：第 1 个账号被两个族在同一瞬间各打
+// 一次，第 2 个账号同样如此，全程如此。默认配置 `checkin_hours` 与 `travel_hours`
+// 都是 `[9,21]`，即每天 9 点与 21 点各发生一次**系统性 2× 瞬时并发**（不是随机抖动，
+// 而是稳定复现的双倍瞬时压力），正是本项目 WAF 403 / 边缘层 fail-fast 一直在防的形态。
+//
+// 取**确定性偏移**而非随机抖动：同族节奏一致，错开一次即永久错开；确定性还让行为
+// 可复现、可测试（随机抖动会让「今天 9 点为什么慢了 3 分钟」无法解释）。
+// 偏移量取 5s：远大于单次请求耗时、又远小于最小槽位间隔（1h），不会跨槽。
+//
+// 声明为 var 是**测试接缝**（与 activityAccountDelay / travelAccountDelay 同口径）：
+// 用例把它置 0 以免每批多等数秒。
+var familyStagger = 5 * time.Second
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
 // 等满返回 true。d<=0 立即放行。
