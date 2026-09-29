@@ -133,6 +133,13 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// 协议兼容层（compat*.go）：Anthropic Messages / OpenAI Responses 直接复用
+	// chatCompletions 的整条账号管线，本层只做入站/出站翻译。鉴权与 chat 同口径
+	// （withCompatAuth 用同一个 httpauth.VerifyBearer + 同一热改 key 快照），仅鉴权
+	// 失败的**错误体形状**按入口协议定制：Anthropic 客户端需要 Anthropic 形状。
+	h.mux.HandleFunc("POST /v1/messages", h.withCompatAuth(h.messages, writeAnthropicAuthError))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withCompatAuth(h.messagesCountTokens, writeAnthropicAuthError))
+	h.mux.HandleFunc("POST /v1/responses", h.withCompatAuth(h.responses, writeOpenAIAuthError))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))

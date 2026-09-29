@@ -23,8 +23,12 @@ import (
 
 // TestMain 默认关闭聊天表格日志（chatLogEnabled=false），消除 go test 期间的 stdout 噪音。
 // 断言表格行输出的测试（logging_test.go 中的 ChatLogs/LogChatRow 系列）用 withChatLog 临时开启。
+//
+// 同时把轮转退避基数置 0（backoff.go 的 rotateBackoffBase 注释即声明「TestMain 已置 0
+// 加速轮转测试」，此前实际未置——注释与行为漂移；退避只影响墙钟，无测试断言其时序）。
 func TestMain(m *testing.M) {
 	chatLogEnabled = false
+	rotateBackoffBase = 0
 	os.Exit(m.Run())
 }
 
